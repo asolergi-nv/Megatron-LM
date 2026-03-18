@@ -408,6 +408,9 @@ class CheckpointConfig:
     exit_on_missing_checkpoint: bool = False
     """If 'load' is set, but checkpoint is not found (e.g., path typo), then exit instead of random initialization."""
 
+    exit_after_loading_ckpt: bool = False
+    """If set, exit the program after loading from a checkpoint. Useful for testing checkpoint loading."""
+
     ckpt_format: Literal["torch", "torch_dist", "torch_dcp", "fsdp_dtensor"] = "torch_dist"
     """ Checkpoint format to use. torch is the format used by torch.save/load.
     torch_dist is a megatron built-in distributed checkpointing format.
