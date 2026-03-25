@@ -406,6 +406,49 @@ def validate_args(args, defaults={}):
                         "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                     )
 
+        # Resolve deprecated --rl-parallel-generation-tasks -> --rl-num-parallel-generations.
+        assert args.rl_num_parallel_generations is None \
+            or args.rl_parallel_generation_tasks is None, \
+            "Cannot specify both --rl-num-parallel-generations and " \
+            "--rl-parallel-generation-tasks. Use --rl-num-parallel-generations " \
+            "(--rl-parallel-generation-tasks is deprecated)."
+        if args.rl_parallel_generation_tasks is not None:
+            print_rank_0(
+                "WARNING: --rl-parallel-generation-tasks is deprecated, "
+                "use --rl-num-parallel-generations instead.")
+            args.rl_num_parallel_generations = (
+                args.rl_parallel_generation_tasks * args.grpo_group_size)
+
+        # Resolve --rl-num-parallel-generations / --rl-num-parallel-generation-batches.
+        assert args.rl_num_parallel_generations is None \
+            or args.rl_num_parallel_generation_batches is None, \
+            "--rl-num-parallel-generations and --rl-num-parallel-generation-batches " \
+            "are mutually exclusive."
+        if args.rl_num_parallel_generations is not None:
+            assert args.rl_partial_rollouts, \
+                "--rl-num-parallel-generations requires --rl-partial-rollouts."
+            assert args.rl_num_parallel_generations % args.grpo_group_size == 0, \
+                f"--rl-num-parallel-generations ({args.rl_num_parallel_generations}) " \
+                f"must be divisible by --grpo-group-size ({args.grpo_group_size})."
+            args.rl_parallel_generation_tasks = (
+                args.rl_num_parallel_generations // args.grpo_group_size)
+            if args.rl_generation_batch_size is None:
+                args.rl_generation_batch_size = 1
+        elif args.rl_num_parallel_generation_batches is not None:
+            assert args.rl_partial_rollouts, \
+                "--rl-num-parallel-generation-batches requires --rl-partial-rollouts."
+            if args.rl_generation_batch_size is None:
+                args.rl_generation_batch_size = args.grpo_prompts_per_step
+            args.rl_parallel_generation_tasks = (
+                args.rl_num_parallel_generation_batches * args.rl_generation_batch_size)
+        else:
+            if args.rl_generation_batch_size is None:
+                args.rl_generation_batch_size = 1
+            args.rl_parallel_generation_tasks = 512
+
+        # Derive enforce_order after all resolution is complete.
+        args.rl_enforce_generation_order = (args.rl_generation_batch_size > 1)
+
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
 
         if args.rl_use_sequence_packing:
@@ -1334,7 +1377,7 @@ def validate_args(args, defaults={}):
         args.iterations_to_skip.extend(iterations_to_skip_from_file)
 
     # Make sure all functionality that requires Gloo process groups is disabled.
-    if not args.enable_gloo_process_groups:
+    if not args.use_gloo_process_groups:
         if args.use_distributed_optimizer:
             # If using distributed optimizer, must use distributed checkpointing.
             # Legacy checkpointing uses Gloo process groups to collect full distributed
@@ -1351,8 +1394,8 @@ def validate_args(args, defaults={}):
         args.check_for_nan_in_loss_and_grad = False
         warn_rank_0('check_for_nan_in_loss_and_grad is set to False for fake process group.')
         # Disable gloo process groups for fake process group
-        args.enable_gloo_process_groups = False
-        warn_rank_0('enable_gloo_process_groups is set to False for fake process group.')
+        args.use_gloo_process_groups = False
+        warn_rank_0('use_gloo_process_groups is set to False for fake process group.')
 
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
@@ -2187,7 +2230,9 @@ def _add_regularization_args(parser):
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
                        choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
-                       help='Scale mode for Muon optimizer')
+                       help='Scale mode for Muon optimizer. With MuP, set '
+                       '--muon-scale-mode unit_rms_norm to use unit_rms_norm scaling, '
+                       'or set --muon-scale-mode spectral to keep spectral scaling.')
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
                        choices=['low', 'medium', 'high'],
                        help='FP32 matmul precision for Newton-Schulz iteration')
@@ -2231,6 +2276,21 @@ def _add_rl_args(parser):
                        help="Number of GRPO groups (G in the paper).")
     group.add_argument('--grpo-group-size', type=int, default=2,
                        help="Number of samples per a GRPO group.")
+    group.add_argument('--rl-num-parallel-generations', type=int, default=None,
+                       help='Number of rollouts being generated by the inference engine simultaneously. '
+                            'Internally divided by grpo_group_size. '
+                            'Requires --rl-partial-rollouts. '
+                            'Mutually exclusive with --rl-num-parallel-generation-batches.')
+    group.add_argument('--rl-num-parallel-generation-batches', type=int, default=None,
+                       help='Number of generation batches in flight. '
+                            'Set to L+1 to allow for L steps of staleness between the inference and training policies. '
+                            'Each batch contains grpo_prompts_per_step groups by default. '
+                            'Requires --rl-partial-rollouts. '
+                            'Mutually exclusive with --rl-num-parallel-generations.')
+    group.add_argument('--rl-generation-batch-size', type=int, default=None,
+                       help='Override the number of groups per generation batch. '
+                            'Defaults to grpo_prompts_per_step when '
+                            '--rl-num-parallel-generation-batches is set.')
     group.add_argument('--grpo-iterations', type=int, default=2,
                        help="Number of iterations per a GRPO implementation.")
     # As in DAPO, we keep upper/lower eps different.
@@ -2265,7 +2325,11 @@ def _add_rl_args(parser):
                        help='Persist CUDA graphs when the inference engine is suspended. '
                             'If False, CUDA graphs are deleted on suspend and re-captured on resume.')
     group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
-                       help='If set, use partial rollouts.')
+                       help='Allow inference to continue generating rollouts while training updates '
+                            'the policy weights. This enables off-policy training where rollouts may '
+                            'be generated with a stale version of the policy. Use '
+                            '--rl-num-parallel-generations or --rl-num-parallel-generation-batches '
+                            'to control the degree of staleness.')
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
@@ -2338,8 +2402,8 @@ def _add_rl_args(parser):
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')
 
-    group.add_argument('--rl-parallel-generation-tasks', type=int, default=512,
-                        help='Number of parallel generation tasks for RL inference.')
+    group.add_argument('--rl-parallel-generation-tasks', type=int, default=None,
+                       help='Deprecated: use --rl-num-parallel-generations instead.')
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
     group.add_argument('--rl-inference-parsers', nargs='*', default=[],
@@ -3139,10 +3203,10 @@ def _add_experimental_args(parser):
                        'For more details, see the model class, '
                        '`transformer_block.py`, or `transformer_layer.py`')
     group.add_argument('--hybrid-layer-pattern', type=str, default=None,
-                       help='Specify a hybrid layer pattern using M (mamba), * (attention), '
-                       '- (mlp), E (moe). Use | to define pipeline stage boundaries for '
-                       'flexible virtual pipeline parallel (fVPP). Use / to separate MTP '
-                       'patterns. Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
+                       help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
+                       '* (attention), - (mlp), E (moe). Use | to define pipeline stage '
+                       'boundaries for flexible virtual pipeline parallel (fVPP). Use / to '
+                       'separate MTP patterns. Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
                        'When this flag is used, it is the sole indicator that a hybrid model '
                        'is being run.')
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
