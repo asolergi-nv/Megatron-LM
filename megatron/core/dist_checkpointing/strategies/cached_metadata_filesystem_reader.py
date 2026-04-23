@@ -4,7 +4,6 @@
 
 import io
 import os
-from pickletools import int4
 from typing import Dict, Union, cast
 
 import torch

@@ -738,7 +738,7 @@ class TorchDistSaveShardedStrategy:
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         """Each async strategy can be trivially used as a sync strategy."""
-        strategy = "mcore" if HAVE_NVRX else "mcore"
+        strategy = "nvrx" if HAVE_NVRX else "mcore"
         async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy=strategy)
         async_request.execute_sync()
         del async_request
@@ -747,7 +747,7 @@ class TorchDistSaveShardedStrategy:
         self,
         sharded_state_dict: ShardedStateDict,
         checkpoint_dir: Path,
-        async_strategy: str = "mcore",
+        async_strategy: str = "nvrx",
     ) -> AsyncRequest | NVRxAsyncRequest:
         """Translates MCore ShardedTensors to PyT ShardedTensors & saves in PyT Distributed format.
 
@@ -908,7 +908,7 @@ class TorchDistSaveShardedStrategy:
 
 
 def _get_filesystem_reader(
-    checkpoint_dir: Union[str, Path], cache_metadata: bool = False, async_strategy: str = "mcore"
+    checkpoint_dir: Union[str, Path], cache_metadata: bool = False, async_strategy: str = "nvrx"
 ) -> FileSystemReader:
     if MultiStorageClientFeature.is_enabled():
         msc = MultiStorageClientFeature.import_package()
@@ -932,7 +932,7 @@ class TorchDistLoadShardedStrategy:
         self,
         sharded_state_dict: ShardedStateDict,
         checkpoint_dir: Path,
-        async_strategy: str = "mcore",
+        async_strategy: str = "nvrx",
     ) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
 
@@ -1111,9 +1111,48 @@ class TorchDistLoadShardedStrategy:
             fs_writer.fs.rm_file(old_path)
 
 
-def get_async_strategy(async_strategy: str = "mcore", module: str = None) -> tuple:
+def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> tuple:
     """Returns async strategy and related async imported modules"""
-    if True:
+    if async_strategy == "nvrx":
+        try:
+            # nvrx async imports
+            from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
+                CachedMetadataFileSystemReader,
+            )
+            from nvidia_resiliency_ext.checkpointing.async_ckpt.core import (
+                AsyncCallsQueue,
+                AsyncRequest,
+            )
+            from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+                FileSystemWriterAsync,
+                _results_queue,
+                get_write_results_queue,
+            )
+            from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
+                CheckpointMetadataCache,
+                save_state_dict_async_finalize,
+                save_state_dict_async_plan,
+            )
+
+            imports = {
+                "AsyncCallsQueue": AsyncCallsQueue,
+                "AsyncRequest": AsyncRequest,
+                "CachedMetadataFileSystemReader": CachedMetadataFileSystemReader,
+                "CheckpointMetadataCache": CheckpointMetadataCache,
+                "FileSystemWriterAsync": FileSystemWriterAsync,
+                "_results_queue": _results_queue,
+                "get_write_results_queue": get_write_results_queue,
+                "save_state_dict_async_finalize": save_state_dict_async_finalize,
+                "save_state_dict_async_plan": save_state_dict_async_plan,
+            }
+            async_strategy = "nvrx"
+        except (ImportError, ModuleNotFoundError):
+            raise ModuleNotFoundError(
+                "nvidia-resiliency-ext package is not installed. "
+                "Please, install nvidia-resiliency-ext package or set `async_strategy` to `mcore` "
+                "to enable async save strategy."
+            )
+    elif async_strategy == "mcore":
         # do mcore async imports
         imports = _import_mcore_async()
         async_strategy = "mcore"

@@ -485,7 +485,7 @@ class CheckpointConfig:
     async_save: bool = False
     """Apply async checkpointing save. Currently works only with `torch_dist` distributed checkpoint format."""
 
-    async_strategy: Literal["nvrx", "mcore"] = "mcore"
+    async_strategy: Literal["nvrx", "mcore"] = "nvrx"
     """Which async save strategy to use. Available strategies: nvrx, mcore."""
 
     use_persistent_ckpt_worker: bool = False
