@@ -66,6 +66,13 @@ class FullyParallelSaveStrategyWrapper:
         do_cache_distribution (bool, optional): whether to cache the save distribution
             from previous calls. Should be set to True only if the state dict
             structure between the calls is always the same. Defaults to True.
+        save_tp_replicated_copies (bool, optional): if True, indicates that the TP
+            dimension of replica_id has been zeroed (by the caller) to save
+            redundant copies of TP-replicated tensors. Skips the post-distribution
+            sharding integrity validation which would otherwise fail because
+            replicated shards now have TP_SIZE main replicas globally.
+            The upstream validation in save_preprocess (with original replica_ids)
+            already ensures correctness. Defaults to False.
     """
 
     def __init__(
@@ -75,6 +82,7 @@ class FullyParallelSaveStrategyWrapper:
         do_cache_distribution: bool = False,
         backend: str = "torch_dist",
         version: int = 1,
+        save_tp_replicated_copies: bool = False,
     ):
         """ """
         self.base_strategy = strategy
@@ -84,6 +92,7 @@ class FullyParallelSaveStrategyWrapper:
         self.do_cache_distribution = do_cache_distribution
         self.backend = backend
         self.version = version
+        self.save_tp_replicated_copies = save_tp_replicated_copies
 
         self.cached_distribution: Optional[ShardDistribution] = None
 
@@ -130,8 +139,12 @@ class FullyParallelSaveStrategyWrapper:
         distribute_main_replicas_with_precomputed_distribution(
             sharded_state_dict, self.parallelization_group, precomputed_distribution
         )
-        if self.cached_distribution is None:
-            # First time applying the parallelization
+        if self.cached_distribution is None and not self.save_tp_replicated_copies:
+            # First time applying the parallelization.
+            # Skip when save_tp_replicated_copies is True because replicated shards
+            # intentionally have TP_SIZE main replicas globally, which would fail
+            # the "exactly once" access check. The upstream validation in
+            # save_preprocess (with original replica_ids) already ensures correctness.
             validate_sharding_integrity(determine_global_metadata(sharded_state_dict)[1])
         if self.do_cache_distribution:
             self.cached_distribution = precomputed_distribution

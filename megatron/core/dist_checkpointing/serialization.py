@@ -295,6 +295,7 @@ def save(
     ] = None,
     content_metadata: Optional[dict] = None,
     async_strategy: Optional[str] = "nvrx",
+    save_tp_replicated_copies: bool = False,
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
 
@@ -340,6 +341,10 @@ def save(
             modify the original state dict
         content_metadata (dict, optional): metadata to identify the checkpoint content.
             Useful for framework specific versioning.
+        save_tp_replicated_copies (bool, optional): if True, each TP rank saves its own
+            copy of TP-replicated tensors (e.g., RMSNorm weights, router weights).
+            This eliminates cross-TP-group file reads during checkpoint loading at
+            the cost of a negligible increase in checkpoint size. Defaults to False.
 
     Returns:
         AsyncRequest (optional): if `async_sharded_save` is True, returns
@@ -375,6 +380,15 @@ def save(
     sharded_state_dict, state_dict = save_preprocess(
         sharded_state_dict, validate_access_integrity, preprocess_common_before_consistancy_check
     )
+
+    # Zero the TP dimension of replica_id so each TP rank saves its own copy
+    # of replicated tensors. This must happen AFTER save_preprocess (which
+    # validates sharding integrity with original replica_ids) but BEFORE the
+    # strategy save (which filters based on is_main_replica).
+    if save_tp_replicated_copies:
+        from .strategies.torch import _zero_replica_id_tp_dim
+
+        _zero_replica_id_tp_dim(sharded_state_dict)
 
     save_common(state_dict, checkpoint_dir)
 

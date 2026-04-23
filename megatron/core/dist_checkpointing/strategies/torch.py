@@ -133,6 +133,32 @@ def flatten_state_dict(
     return flattened, mappings
 
 
+def _zero_replica_id_tp_dim(sharded_state_dict: ShardedStateDict) -> None:
+    """Zero out the TP dimension (index 1) of replica_id for all ShardedBase objects.
+
+    For TP-replicated tensors (e.g., RMSNorm weights), replica_id is typically
+    (PP, tp_rank, dp_rank). By zeroing the TP dimension, each TP rank's dp=0 copy
+    becomes a "main replica", causing each TP rank to save its own copy.
+
+    For TP-sharded tensors, the TP dimension of replica_id is already 0 (since each
+    TP rank holds a different shard, not a replica), so this is a no-op for them.
+
+    This eliminates cross-TP-group reads during checkpoint loading: each rank can
+    read replicated tensors from its own shard file instead of all ranks contending
+    on a single file.
+
+    Args:
+        sharded_state_dict: state dict to modify in-place.
+    """
+    for sh_base in nested_values(sharded_state_dict):
+        if isinstance(sh_base, ShardedBase):
+            rid = sh_base.replica_id
+            if isinstance(rid, tuple) and len(rid) > 1:
+                new_rid = list(rid)
+                new_rid[1] = 0
+                sh_base.replica_id = tuple(new_rid)
+
+
 def sharded_tensor_to_torch_sharded_tensor(
     sh_tens: List[ShardedTensor],
     rank: Optional[int] = None,
@@ -542,13 +568,73 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
                 md.size = size
 
     def create_local_plan(self) -> LoadPlan:
-        """Runs additional shapes validation."""
+        """Runs additional shapes validation and deduplicates redundant read items."""
         self._validate_global_shapes(self.metadata, self.shapes_validation_sharded_tensors)
 
         with self._temporarily_bypass_shape_validation():
             local_plan = super().create_local_plan()
 
+        local_plan = self._deduplicate_read_items(local_plan)
         return local_plan
+
+    def _deduplicate_read_items(self, plan: LoadPlan) -> LoadPlan:
+        """Remove duplicate ReadItems for the same destination, preferring own shard file.
+
+        When replicated tensors are saved redundantly across TP ranks (via
+        save_tp_replicated_copies), the checkpoint metadata has multiple stored
+        chunks for the same tensor in different files. The default load planner
+        creates ReadItems for ALL of them. This method keeps only the one from
+        this rank's own file, eliminating cross-rank file reads.
+
+        For backward compatibility with checkpoints that have a single copy, or
+        for resharding scenarios where the own file doesn't contain the tensor,
+        falls back to keeping one arbitrary ReadItem.
+
+        Args:
+            plan: the LoadPlan produced by the default planner.
+
+        Returns:
+            LoadPlan with deduplicated items.
+        """
+        import dataclasses
+
+        if len(plan.items) == 0:
+            return plan
+
+        rank = torch.distributed.get_rank()
+        own_prefix = f"__{rank}_"
+
+        # Group items by destination identity (what memory region they write to)
+        dest_groups: Dict[tuple, List[ReadItem]] = defaultdict(list)
+        for item in plan.items:
+            key = (item.dest_index.fqn, item.dest_offsets, item.lengths)
+            dest_groups[key].append(item)
+
+        filtered_items: List[ReadItem] = []
+        for items in dest_groups.values():
+            if len(items) <= 1:
+                filtered_items.extend(items)
+                continue
+
+            # Multiple items for same destination — prefer own file
+            own_items = [
+                item
+                for item in items
+                if self._is_from_own_file(item.storage_index, own_prefix)
+            ]
+            filtered_items.append(own_items[0] if own_items else items[0])
+
+        return dataclasses.replace(plan, items=filtered_items)
+
+    def _is_from_own_file(self, storage_index, own_prefix: str) -> bool:
+        """Check if a storage_index refers to a file belonging to the current rank."""
+        storage_info = self.metadata.storage_data.get(storage_index)
+        if storage_info is None:
+            return False
+        relative_path = getattr(storage_info, 'relative_path', None)
+        if relative_path is None:
+            return False
+        return relative_path.startswith(own_prefix)
 
     def resolve_tensor(self, read_item: ReadItem):
         """Override to add FP8 support.
@@ -652,7 +738,7 @@ class TorchDistSaveShardedStrategy:
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         """Each async strategy can be trivially used as a sync strategy."""
-        strategy = "nvrx" if HAVE_NVRX else "mcore"
+        strategy = "mcore" if HAVE_NVRX else "mcore"
         async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy=strategy)
         async_request.execute_sync()
         del async_request
@@ -661,7 +747,7 @@ class TorchDistSaveShardedStrategy:
         self,
         sharded_state_dict: ShardedStateDict,
         checkpoint_dir: Path,
-        async_strategy: str = "nvrx",
+        async_strategy: str = "mcore",
     ) -> AsyncRequest | NVRxAsyncRequest:
         """Translates MCore ShardedTensors to PyT ShardedTensors & saves in PyT Distributed format.
 
@@ -822,7 +908,7 @@ class TorchDistSaveShardedStrategy:
 
 
 def _get_filesystem_reader(
-    checkpoint_dir: Union[str, Path], cache_metadata: bool = False, async_strategy: str = "nvrx"
+    checkpoint_dir: Union[str, Path], cache_metadata: bool = False, async_strategy: str = "mcore"
 ) -> FileSystemReader:
     if MultiStorageClientFeature.is_enabled():
         msc = MultiStorageClientFeature.import_package()
@@ -846,7 +932,7 @@ class TorchDistLoadShardedStrategy:
         self,
         sharded_state_dict: ShardedStateDict,
         checkpoint_dir: Path,
-        async_strategy: str = "nvrx",
+        async_strategy: str = "mcore",
     ) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
 
@@ -1025,48 +1111,9 @@ class TorchDistLoadShardedStrategy:
             fs_writer.fs.rm_file(old_path)
 
 
-def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> tuple:
+def get_async_strategy(async_strategy: str = "mcore", module: str = None) -> tuple:
     """Returns async strategy and related async imported modules"""
-    if async_strategy == "nvrx":
-        try:
-            # nvrx async imports
-            from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
-                CachedMetadataFileSystemReader,
-            )
-            from nvidia_resiliency_ext.checkpointing.async_ckpt.core import (
-                AsyncCallsQueue,
-                AsyncRequest,
-            )
-            from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
-                FileSystemWriterAsync,
-                _results_queue,
-                get_write_results_queue,
-            )
-            from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
-                CheckpointMetadataCache,
-                save_state_dict_async_finalize,
-                save_state_dict_async_plan,
-            )
-
-            imports = {
-                "AsyncCallsQueue": AsyncCallsQueue,
-                "AsyncRequest": AsyncRequest,
-                "CachedMetadataFileSystemReader": CachedMetadataFileSystemReader,
-                "CheckpointMetadataCache": CheckpointMetadataCache,
-                "FileSystemWriterAsync": FileSystemWriterAsync,
-                "_results_queue": _results_queue,
-                "get_write_results_queue": get_write_results_queue,
-                "save_state_dict_async_finalize": save_state_dict_async_finalize,
-                "save_state_dict_async_plan": save_state_dict_async_plan,
-            }
-            async_strategy = "nvrx"
-        except (ImportError, ModuleNotFoundError):
-            raise ModuleNotFoundError(
-                "nvidia-resiliency-ext package is not installed. "
-                "Please, install nvidia-resiliency-ext package or set `async_strategy` to `mcore` "
-                "to enable async save strategy."
-            )
-    elif async_strategy == "mcore":
+    if True:
         # do mcore async imports
         imports = _import_mcore_async()
         async_strategy = "mcore"
