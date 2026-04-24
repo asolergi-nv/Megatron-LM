@@ -273,20 +273,31 @@ def determine_main_replica_uniform_distribution(
     # Filter out shards that don't belong to this group
     shard_to_ranks = {k: v for k, v in shard_to_ranks.items() if k in shards_in_this_group}
 
-    # Pin renamed TP-replicated shards (``fqn/_tpN``) to their natural main
-    # replica (the single rank in the DP group whose ``replica_id`` is all
-    # zeros after ``_zero_replica_id_tp_dim``). This restricts the greedy's
-    # candidate set to one rank, so the assignment for these shards becomes
-    # deterministic independent of the rest of the state dict — guaranteeing
-    # that the rank which writes the shard at save time is also the rank
-    # that reads it at load time (writer == reader, no cross-DP reads).
-    # Non-renamed shards keep their original size-balanced greedy behaviour.
+    # Pin renamed TP-replicated shards (``fqn/_tpN``) to a single, deterministic
+    # rank in the parallelization group so that save and load always land on
+    # the same rank (writer == reader → no cross-DP reads).
+    #
+    # We pick ``min(shard_to_main_ranks[shard_id])`` — the lowest within-group
+    # position whose ``replica_id`` is all-zeros after
+    # ``_zero_replica_id_tp_dim``. This matters for parallelization groups that
+    # span multiple DP sub-groups (e.g. ``ep_dp`` with EP>1 or any group
+    # that contains more than one rank with ``dp_replica_id == 0``): if we
+    # passed the full main-replica set to ``distribute_shards_to_ranks``, the
+    # greedy would still load-balance across them, and small differences in
+    # the state-dict contents between save and load could route the same shard
+    # to different ranks on the two sides.
+    #
+    # As a defensive fallback, if a renamed shard somehow has no main replica
+    # in the parallelization group (shouldn't happen — ``_zero_replica_id_tp_dim``
+    # always promotes one — but in case of a stale/cached state dict), we pin
+    # to ``min(shard_to_ranks[shard_id])`` instead, which is still deterministic
+    # across save and load. Non-renamed shards are untouched.
     for shard_id in list(shard_to_ranks.keys()):
         if not _is_tp_replicated_renamed_shard(shard_id):
             continue
-        pinned = shard_to_main_ranks.get(shard_id)
+        pinned = shard_to_main_ranks.get(shard_id) or shard_to_ranks[shard_id]
         if pinned:
-            shard_to_ranks[shard_id] = list(pinned)
+            shard_to_ranks[shard_id] = [min(pinned)]
 
     shard_to_saving_rank = distribute_shards_to_ranks(
         shard_to_ranks, shard_to_size, len(all_shards), cross_parallelization_group_loads
