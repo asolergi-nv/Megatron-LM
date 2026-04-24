@@ -523,6 +523,13 @@ class CheckpointConfig:
     "ep_dp": Expert data parallel process group.
     """
 
+    save_tp_replicated_copies: bool = False
+    """If set, each TP rank saves its own copy of TP-replicated tensors (e.g., RMSNorm
+    weights, router weights, and their optimizer states). This eliminates cross-TP-group
+    file reads during checkpoint loading (each rank reads replicated tensors from its own
+    shard file) at the cost of a small increase in checkpoint size. Only applies to the
+    `torch_dist` checkpoint format."""
+
     ckpt_fully_parallel_load_process_group: Literal["dp", "ep_dp"] = "dp"
     """Process group for fully parallel load of distributed checkpoints.
     "dp"(default): Data parallel process group.

@@ -666,8 +666,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                         process_group = mpu.get_data_parallel_group(with_context_parallel=True)
                     elif args.ckpt_fully_parallel_save_process_group == 'ep_dp':
                         process_group = mpu.get_expert_data_parallel_group()
-                    save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, process_group,
-                                                                     args.ckpt_assume_constant_structure)
+                    save_strategy = FullyParallelSaveStrategyWrapper(
+                        save_strategy, process_group,
+                        args.ckpt_assume_constant_structure,
+                        save_tp_replicated_copies=args.save_tp_replicated_copies,
+                    )
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy
@@ -678,7 +681,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                                          validate_access_integrity=validate_sharding_integrity,
                                                          preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
                                                          content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
-                                                         async_strategy=args.async_strategy)
+                                                         async_strategy=args.async_strategy,
+                                                         save_tp_replicated_copies=args.save_tp_replicated_copies)
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
