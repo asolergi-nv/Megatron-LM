@@ -134,14 +134,24 @@ def flatten_state_dict(
 
 
 def _zero_replica_id_tp_dim(sharded_state_dict: ShardedStateDict) -> None:
-    """Zero out the TP dimension (index 1) of replica_id for all ShardedBase objects.
+    """Zero out the TP dimension (index 1) of replica_id for ShardedTensors.
 
     For TP-replicated tensors (e.g., RMSNorm weights), replica_id is typically
     (PP, tp_rank, dp_rank). By zeroing the TP dimension, each TP rank's dp=0 copy
-    becomes a "main replica", causing each TP rank to save its own copy.
+    becomes a "main replica", causing each TP rank to save its own copy (under a
+    per-TP-renamed key, set by `_rename_tp_replicated_keys`).
 
     For TP-sharded tensors, the TP dimension of replica_id is already 0 (since each
     TP rank holds a different shard, not a replica), so this is a no-op for them.
+
+    Only ``ShardedTensor`` is affected. ``ShardedObject`` (BYTE_IO, e.g. TE
+    ``_extra_state``) is intentionally skipped because we do **not** rename its
+    key per TP rank — zeroing its replica_id would produce multiple globally-main
+    replicas for the same key, which makes load-time
+    ``validate_sharding_integrity`` fail with "Duplicate ShardedObject keys" /
+    "Invalid access pattern: -N ShardedObject are missing". Leaving
+    ShardedObject replica_ids untouched keeps exactly one global main replica
+    (the original ``(0, 0, 0)`` rank), matching pre-feature behavior for BYTE_IO.
 
     This eliminates cross-TP-group reads during checkpoint loading: each rank can
     read replicated tensors from its own shard file instead of all ranks contending
@@ -151,12 +161,13 @@ def _zero_replica_id_tp_dim(sharded_state_dict: ShardedStateDict) -> None:
         sharded_state_dict: state dict to modify in-place.
     """
     for sh_base in nested_values(sharded_state_dict):
-        if isinstance(sh_base, ShardedBase):
-            rid = sh_base.replica_id
-            if isinstance(rid, tuple) and len(rid) > 1:
-                new_rid = list(rid)
-                new_rid[1] = 0
-                sh_base.replica_id = tuple(new_rid)
+        if not isinstance(sh_base, ShardedTensor):
+            continue
+        rid = sh_base.replica_id
+        if isinstance(rid, tuple) and len(rid) > 1:
+            new_rid = list(rid)
+            new_rid[1] = 0
+            sh_base.replica_id = tuple(new_rid)
 
 
 TP_REPLICATED_KEY_SUFFIX = '/_tp'
