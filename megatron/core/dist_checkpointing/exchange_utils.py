@@ -36,6 +36,30 @@ def is_float8tensor(tensor: torch.Tensor) -> bool:
 logger = logging.getLogger(__name__)
 
 
+# Must match ``TP_REPLICATED_KEY_SUFFIX`` in ``strategies/torch.py``.
+# Duplicated here to avoid importing from the ``strategies/`` subpackage at
+# module load time (it pulls in heavy PyT DCP internals that aren't needed
+# for the lightweight utilities in this file).
+_TP_REPLICATED_KEY_SUFFIX = '/_tp'
+
+
+def _is_tp_replicated_renamed_shard(shard_id: _ShardId) -> bool:
+    """Return True iff ``shard_id``'s fqn carries the ``/_tpN`` suffix
+    added by ``_rename_tp_replicated_keys``.
+
+    These are TP-replicated tensors whose key was made per-TP-rank unique
+    by the ``save_tp_replicated_copies`` feature. Their natural main replica
+    sits on exactly one rank in the DP group (the dp=0 rank after
+    ``_zero_replica_id_tp_dim``), so we can pin both save and load to that
+    rank and guarantee writer == reader without relying on the greedy
+    balancer reproducing the same assignment twice.
+    """
+    if not isinstance(shard_id, tuple) or not shard_id:
+        return False
+    fqn = shard_id[0]
+    return isinstance(fqn, str) and _TP_REPLICATED_KEY_SUFFIX in fqn
+
+
 class ShardDistribution(NamedTuple):
     """Represents a distribution of ShardedTensors.
 
@@ -218,6 +242,10 @@ def determine_main_replica_uniform_distribution(
     shard_to_ranks = defaultdict(list)
     shard_to_size = {}
     shard_to_metadata = {}
+    # Track, per shard, the subset of ranks whose local copy is the main
+    # replica (is_main_replica(replica_id) == True). Used below to pin the
+    # greedy assignment for renamed TP-replicated shards.
+    shard_to_main_ranks: Dict[_ShardId, List[int]] = defaultdict(list)
     group_has_main_replica: Set[_ShardId] = set()
     group_has_non_main_replica: Set[_ShardId] = set()
 
@@ -230,6 +258,7 @@ def determine_main_replica_uniform_distribution(
                 shard_to_metadata[shard_id] = sh_ten
             if is_main_replica(sh_ten.replica_id):
                 group_has_main_replica.add(shard_id)
+                shard_to_main_ranks[shard_id].append(rank)
             else:
                 group_has_non_main_replica.add(shard_id)
 
@@ -243,6 +272,21 @@ def determine_main_replica_uniform_distribution(
 
     # Filter out shards that don't belong to this group
     shard_to_ranks = {k: v for k, v in shard_to_ranks.items() if k in shards_in_this_group}
+
+    # Pin renamed TP-replicated shards (``fqn/_tpN``) to their natural main
+    # replica (the single rank in the DP group whose ``replica_id`` is all
+    # zeros after ``_zero_replica_id_tp_dim``). This restricts the greedy's
+    # candidate set to one rank, so the assignment for these shards becomes
+    # deterministic independent of the rest of the state dict — guaranteeing
+    # that the rank which writes the shard at save time is also the rank
+    # that reads it at load time (writer == reader, no cross-DP reads).
+    # Non-renamed shards keep their original size-balanced greedy behaviour.
+    for shard_id in list(shard_to_ranks.keys()):
+        if not _is_tp_replicated_renamed_shard(shard_id):
+            continue
+        pinned = shard_to_main_ranks.get(shard_id)
+        if pinned:
+            shard_to_ranks[shard_id] = list(pinned)
 
     shard_to_saving_rank = distribute_shards_to_ranks(
         shard_to_ranks, shard_to_size, len(all_shards), cross_parallelization_group_loads
