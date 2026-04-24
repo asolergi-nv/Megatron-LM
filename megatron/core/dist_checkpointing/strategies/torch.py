@@ -162,30 +162,52 @@ def _zero_replica_id_tp_dim(sharded_state_dict: ShardedStateDict) -> None:
 TP_REPLICATED_KEY_SUFFIX = '/_tp'
 
 
-def _is_tp_replicated(sh_ten: ShardedTensor) -> bool:
-    """Return True if `sh_ten` is not sharded on any non-prepended axis.
+def _is_main_tp_replicated(sh_ten: ShardedTensor, main_tp_rank: int) -> bool:
+    """Return True iff `sh_ten` is replicated across the main TP group.
 
-    Non-prepended axes are the "real" tensor axes; prepended axes typically
-    encode PP/layer slots. A tensor with every non-prepended axis unfragmented
-    is fully replicated within its prepend group — in MCore this matches the
-    TP-replicated pattern (same data on every TP rank within a PP stage).
+    Two conditions must both hold, intentionally conservative to avoid false
+    positives in MoE/expert paths that use separate expert-TP groups:
+
+    1. **Shape**: `local_shape == global_shape[prepend_axis_num:]` — this
+       rank's shard covers the entire non-prepended global region, so no
+       non-prepended axis is actually sharded. `axis_fragmentations` alone is
+       insufficient because some paths (notably TE grouped expert linears with
+       `explicit_expert_comm`) don't reflect the main-TP sharding in the
+       ShardedTensor declaration.
+
+    2. **Replica id**: `replica_id[1] == main_tp_rank`. This is the signature
+       of `make_sharded_tensor_for_checkpoint(..., tp_group=main_tp_group)`,
+       which sets `replica_id = (0, get_pg_rank(main_tp_group), dp_replica_id)`.
+       `make_tp_sharded_tensor_for_checkpoint` and the expert paths
+       (`TEGroupedLinear` overwrites replica_id[2] but leaves replica_id[1]
+       determined by `expt_tp`, not main TP) both fail this check on at least
+       some ranks, which correctly excludes them.
+
+    Must be called with the **original** replica_id, i.e. *before*
+    `_zero_replica_id_tp_dim`.
     """
-    if sh_ten.axis_fragmentations is None:
+    # Shape: shard covers full non-prepended region.
+    non_prepended_global = tuple(sh_ten.global_shape[sh_ten.prepend_axis_num :])
+    if tuple(sh_ten.local_shape) != non_prepended_global:
         return False
-    return all(f == 1 for f in sh_ten.axis_fragmentations[sh_ten.prepend_axis_num :])
+    # Replica id: original rid[1] must be the main TP rank.
+    rid = sh_ten.replica_id
+    if not isinstance(rid, tuple) or len(rid) < 2:
+        return False
+    return rid[1] == main_tp_rank
 
 
 def _rename_tp_replicated_keys(
-    sharded_state_dict: ShardedStateDict, tp_rank: int, reverse: bool = False
+    sharded_state_dict: ShardedStateDict, main_tp_rank: int, reverse: bool = False
 ) -> None:
-    """Append (or strip) a per-TP-rank suffix on TP-replicated ShardedTensor keys.
+    """Append (or strip) a per-TP-rank suffix on main-TP-replicated ShardedTensor keys.
 
-    When `save_tp_replicated_copies=True`, each TP rank saves its own copy of
-    each TP-replicated tensor. PyTorch DCP's `MetadataIndex` hashes/compares
-    on `(fqn, offset)` only (the `index` hint is excluded), so multiple TP
-    copies with identical `(fqn, offset)` collapse to one entry in
-    `metadata.storage_data`. Making the key unique per TP rank
-    (`fqn` -> `fqn/_tp{tp_rank}`) sidesteps that collision entirely — no
+    When `save_tp_replicated_copies=True`, each main-TP rank saves its own
+    copy of each main-TP-replicated tensor. PyTorch DCP's `MetadataIndex`
+    hashes/compares on `(fqn, offset)` only (the `index` hint is excluded),
+    so multiple TP copies with identical `(fqn, offset)` collapse to one entry
+    in `metadata.storage_data`. Making the key unique per main-TP rank
+    (`fqn` -> `fqn/_tp{main_tp_rank}`) sidesteps that collision entirely — no
     dedup collective needed. The exact same rename is applied on load so each
     rank looks up its own copy and reads from its own file.
 
@@ -193,16 +215,20 @@ def _rename_tp_replicated_keys(
     because its metadata slot is one-per-fqn by construction — those stay
     cross-read, which is acceptable for TE `_extra_state`.
 
+    Must run *before* `_zero_replica_id_tp_dim`: the classifier inspects the
+    original replica_id to tell main-TP-replicated tensors apart from
+    TP-sharded and expert-path tensors that happen to pass the shape check.
+
     Args:
         sharded_state_dict: state dict to rewrite in place.
-        tp_rank: TP rank whose suffix to apply (current rank's tp_rank).
+        main_tp_rank: main tensor-parallel rank of the current process.
         reverse: if True, strip the suffix instead of appending it.
     """
-    suffix = f"{TP_REPLICATED_KEY_SUFFIX}{tp_rank}"
+    suffix = f"{TP_REPLICATED_KEY_SUFFIX}{main_tp_rank}"
     for sh_base in nested_values(sharded_state_dict):
         if not isinstance(sh_base, ShardedTensor):
             continue
-        if not _is_tp_replicated(sh_base):
+        if not _is_main_tp_replicated(sh_base, main_tp_rank):
             continue
         if reverse:
             if sh_base.key.endswith(suffix):
