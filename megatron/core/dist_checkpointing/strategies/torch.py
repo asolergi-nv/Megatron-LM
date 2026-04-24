@@ -34,7 +34,6 @@ from torch.distributed.checkpoint import (
     TensorStorageMetadata,
     WriteItem,
 )
-from torch.distributed.checkpoint.planner import WriteItemType
 from torch.distributed.checkpoint._nested_dict import FLATTEN_MAPPING, unflatten_state_dict
 from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
 from torch.distributed.checkpoint.metadata import Metadata
@@ -158,6 +157,58 @@ def _zero_replica_id_tp_dim(sharded_state_dict: ShardedStateDict) -> None:
                 new_rid = list(rid)
                 new_rid[1] = 0
                 sh_base.replica_id = tuple(new_rid)
+
+
+TP_REPLICATED_KEY_SUFFIX = '/_tp'
+
+
+def _is_tp_replicated(sh_ten: ShardedTensor) -> bool:
+    """Return True if `sh_ten` is not sharded on any non-prepended axis.
+
+    Non-prepended axes are the "real" tensor axes; prepended axes typically
+    encode PP/layer slots. A tensor with every non-prepended axis unfragmented
+    is fully replicated within its prepend group — in MCore this matches the
+    TP-replicated pattern (same data on every TP rank within a PP stage).
+    """
+    if sh_ten.axis_fragmentations is None:
+        return False
+    return all(f == 1 for f in sh_ten.axis_fragmentations[sh_ten.prepend_axis_num :])
+
+
+def _rename_tp_replicated_keys(
+    sharded_state_dict: ShardedStateDict, tp_rank: int, reverse: bool = False
+) -> None:
+    """Append (or strip) a per-TP-rank suffix on TP-replicated ShardedTensor keys.
+
+    When `save_tp_replicated_copies=True`, each TP rank saves its own copy of
+    each TP-replicated tensor. PyTorch DCP's `MetadataIndex` hashes/compares
+    on `(fqn, offset)` only (the `index` hint is excluded), so multiple TP
+    copies with identical `(fqn, offset)` collapse to one entry in
+    `metadata.storage_data`. Making the key unique per TP rank
+    (`fqn` -> `fqn/_tp{tp_rank}`) sidesteps that collision entirely — no
+    dedup collective needed. The exact same rename is applied on load so each
+    rank looks up its own copy and reads from its own file.
+
+    Only `ShardedTensor` is touched; `ShardedObject` (BYTE_IO) is skipped
+    because its metadata slot is one-per-fqn by construction — those stay
+    cross-read, which is acceptable for TE `_extra_state`.
+
+    Args:
+        sharded_state_dict: state dict to rewrite in place.
+        tp_rank: TP rank whose suffix to apply (current rank's tp_rank).
+        reverse: if True, strip the suffix instead of appending it.
+    """
+    suffix = f"{TP_REPLICATED_KEY_SUFFIX}{tp_rank}"
+    for sh_base in nested_values(sharded_state_dict):
+        if not isinstance(sh_base, ShardedTensor):
+            continue
+        if not _is_tp_replicated(sh_base):
+            continue
+        if reverse:
+            if sh_base.key.endswith(suffix):
+                sh_base.key = sh_base.key[: -len(suffix)]
+        else:
+            sh_base.key = sh_base.key + suffix
 
 
 def sharded_tensor_to_torch_sharded_tensor(
@@ -447,7 +498,6 @@ class MCoreSavePlanner(DefaultSavePlanner):
         *args,
         dedup_replicated_tensors: Optional[bool] = None,
         can_run_decentralized_global_plan: bool = True,
-        save_tp_replicated_copies: bool = False,
         **kwargs,
     ) -> None:
         # `dedup_replicated_tensors` was deprecated in 2.3; this check avoids warnings
@@ -457,16 +507,6 @@ class MCoreSavePlanner(DefaultSavePlanner):
         if get_torch_version() <= PkgVersion("2.2"):
             kwargs['dedup_replicated_tensors'] = dedup_replicated_tensors
         super().__init__(*args, **kwargs)
-        self.save_tp_replicated_copies = save_tp_replicated_copies
-        # When preserving TP-replicated copies, the planner must run through the
-        # centralized reduce_scatter path: `create_default_global_save_plan`
-        # rewrites each WriteItem's `MetadataIndex.index` to a distinct chunk id,
-        # and those rewritten indices are what make `storage_data` record N
-        # entries (one per TP copy) rather than collapsing to one. Ranks need
-        # their rewritten slice scattered back — decentralized mode would
-        # discard the rewrites and the metadata would still collapse.
-        if save_tp_replicated_copies:
-            can_run_decentralized_global_plan = False
         self.can_run_decentralized_global_plan = can_run_decentralized_global_plan
         if can_run_decentralized_global_plan:
             assert (
@@ -475,48 +515,6 @@ class MCoreSavePlanner(DefaultSavePlanner):
             assert (
                 not self.flatten_state_dict
             ), 'Cannot run decentralized plan with flatten_state_dict=True'
-
-    def _dedup_save_plans(self, all_plans: List[SavePlan]) -> List[SavePlan]:
-        """Dedup BYTE_IO only when save_tp_replicated_copies is set.
-
-        When preserving per-TP copies, SHARD WriteItems with identical
-        `MetadataIndex` must survive into `create_default_global_save_plan`
-        so each becomes a distinct chunk (with a rewritten `index` hint).
-        BYTE_IO items still have to be deduped because `state_dict_metadata`
-        is keyed by fqn and `create_default_global_save_plan` asserts
-        uniqueness for non-SHARD items.
-        """
-        if not self.save_tp_replicated_copies:
-            return super()._dedup_save_plans(all_plans)
-
-        import dataclasses as _dc
-
-        # For each BYTE_IO `MetadataIndex`, pick one plan to keep it and drop
-        # from the rest. Mirrors the lowest-rank selection used by the default
-        # dedup so behavior is predictable across saves.
-        bio_to_plans: Dict[Any, List[int]] = defaultdict(list)
-        for plan_idx, plan in enumerate(all_plans):
-            for item in plan.items:
-                if item.type == WriteItemType.BYTE_IO:
-                    bio_to_plans[item.index].append(plan_idx)
-
-        drop: Dict[int, set] = defaultdict(set)
-        for idx, plan_indices in bio_to_plans.items():
-            keeper = min(plan_indices)
-            for plan_idx in plan_indices:
-                if plan_idx != keeper:
-                    drop[plan_idx].add(idx)
-
-        if not drop:
-            return list(all_plans)
-
-        return [
-            _dc.replace(
-                plan,
-                items=[item for item in plan.items if item.index not in drop.get(i, ())],
-            )
-            for i, plan in enumerate(all_plans)
-        ]
 
     def create_local_plan(self) -> SavePlan:
         """Adds IOBytes write request on non-coordinator ranks."""
@@ -742,7 +740,6 @@ class TorchDistSaveShardedStrategy:
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
         cpu_shm_mode: bool = False,
-        save_tp_replicated_copies: bool = False,
     ):
         """Adds parameters specific to PyT Distributed format
         Args:
@@ -766,7 +763,6 @@ class TorchDistSaveShardedStrategy:
         self.version = version
         self.keep_only_main_replica = keep_only_main_replica
         self.thread_count = thread_count
-        self.save_tp_replicated_copies = save_tp_replicated_copies
 
         # Cached SavePlans to skip plan in `save_state_dict_async_plan`
         # cached outcome of `SavePlan.prepare_global_plan`,
@@ -901,7 +897,6 @@ class TorchDistSaveShardedStrategy:
                 dedup_replicated_tensors=not self.keep_only_main_replica,
                 flatten_state_dict=False,
                 flatten_sharded_tensors=False,
-                save_tp_replicated_copies=self.save_tp_replicated_copies,
             ),
             **state_dict_saver_kwargs,
         )

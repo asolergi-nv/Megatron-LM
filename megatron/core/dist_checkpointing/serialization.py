@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 CkptShardedMetadata = Dict[str, Union[ShardedTensor, ShardedObject]]
 
 _CONTENT_METADATA_KEY = 'content_metadata'
+_TP_REPLICATED_COPIES_MARKER = 'save_tp_replicated_copies'
 
 
 def load(
@@ -113,6 +114,15 @@ def load(
 
     common_state_dict = load_common(checkpoint_dir)
 
+    # Was this checkpoint saved with `save_tp_replicated_copies=True`? If so,
+    # the save stored each TP rank's copy under a per-TP-renamed key; we must
+    # mirror that rename (and the replica_id zeroing) here so each rank looks
+    # up its own copy in the metadata and reads from its own file.
+    _ckpt_content_metadata = common_state_dict.get(_CONTENT_METADATA_KEY) or {}
+    _load_tp_replicated_copies = bool(
+        _ckpt_content_metadata.get(_TP_REPLICATED_COPIES_MARKER, False)
+    )
+
     sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
         sharded_state_dict
     )
@@ -120,6 +130,16 @@ def load(
 
     # At this point we are only dealing with ShardedBase objects
     sharded_state_dict, _ = extract_sharded_base(sharded_state_dict)
+
+    if _load_tp_replicated_copies:
+        from megatron.core import parallel_state
+
+        from .strategies.torch import _rename_tp_replicated_keys, _zero_replica_id_tp_dim
+
+        _zero_replica_id_tp_dim(sharded_state_dict)
+        _rename_tp_replicated_keys(
+            sharded_state_dict, parallel_state.get_tensor_model_parallel_rank()
+        )
 
     # Validation
     ckpt_sharded_metadata = None
@@ -374,6 +394,12 @@ def save(
     ):
         sharded_strategy = TorchDistSaveShardedStrategy()
 
+    if save_tp_replicated_copies:
+        # Stash a marker in content_metadata so load() can mirror the rewrite.
+        if content_metadata is None:
+            content_metadata = {}
+        content_metadata[_TP_REPLICATED_COPIES_MARKER] = True
+
     if content_metadata is not None:
         sharded_state_dict[_CONTENT_METADATA_KEY] = content_metadata
 
@@ -382,13 +408,21 @@ def save(
     )
 
     # Zero the TP dimension of replica_id so each TP rank saves its own copy
-    # of replicated tensors. This must happen AFTER save_preprocess (which
-    # validates sharding integrity with original replica_ids) but BEFORE the
-    # strategy save (which filters based on is_main_replica).
+    # of replicated tensors, and rename each TP copy's key so PyT DCP keeps
+    # them as distinct metadata entries (MetadataIndex hashes on (fqn, offset)
+    # only, so identical (fqn, offset) across TP ranks would otherwise collapse
+    # to a single storage_data entry). Both happen AFTER save_preprocess
+    # (which validates sharding with the original replica_ids) but BEFORE the
+    # strategy save (which filters on is_main_replica and builds WriteItems).
     if save_tp_replicated_copies:
-        from .strategies.torch import _zero_replica_id_tp_dim
+        from megatron.core import parallel_state
+
+        from .strategies.torch import _rename_tp_replicated_keys, _zero_replica_id_tp_dim
 
         _zero_replica_id_tp_dim(sharded_state_dict)
+        _rename_tp_replicated_keys(
+            sharded_state_dict, parallel_state.get_tensor_model_parallel_rank()
+        )
 
     save_common(state_dict, checkpoint_dir)
 
