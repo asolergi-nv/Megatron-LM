@@ -162,39 +162,45 @@ def _zero_replica_id_tp_dim(sharded_state_dict: ShardedStateDict) -> None:
 TP_REPLICATED_KEY_SUFFIX = '/_tp'
 
 
-def _is_main_tp_replicated(sh_ten: ShardedTensor, main_tp_rank: int) -> bool:
-    """Return True iff `sh_ten` is replicated across the main TP group.
+def _is_main_tp_replicated(sh_ten: ShardedTensor) -> bool:
+    """Return True iff `sh_ten`'s local shard covers the entire non-prepended
+    global region — i.e. no non-prepended axis is TP-sharded.
 
-    Two conditions must both hold, intentionally conservative to avoid false
-    positives in MoE/expert paths that use separate expert-TP groups:
+    This is a **shape**-based check that is consistent across all main-TP
+    ranks: every rank sees the same `local_shape` and `global_shape` for a
+    main-TP-replicated tensor, so every rank reaches the same classification.
 
-    1. **Shape**: `local_shape == global_shape[prepend_axis_num:]` — this
-       rank's shard covers the entire non-prepended global region, so no
-       non-prepended axis is actually sharded. `axis_fragmentations` alone is
-       insufficient because some paths (notably TE grouped expert linears with
-       `explicit_expert_comm`) don't reflect the main-TP sharding in the
-       ShardedTensor declaration.
-
-    2. **Replica id**: `replica_id[1] == main_tp_rank`. This is the signature
-       of `make_sharded_tensor_for_checkpoint(..., tp_group=main_tp_group)`,
-       which sets `replica_id = (0, get_pg_rank(main_tp_group), dp_replica_id)`.
-       `make_tp_sharded_tensor_for_checkpoint` and the expert paths
-       (`TEGroupedLinear` overwrites replica_id[2] but leaves replica_id[1]
-       determined by `expt_tp`, not main TP) both fail this check on at least
-       some ranks, which correctly excludes them.
-
-    Must be called with the **original** replica_id, i.e. *before*
-    `_zero_replica_id_tp_dim`.
+    Note: this also returns True for MoE routed-expert tensors whose
+    `expt_tp_size == 1`, which are *not* what we want to rename (their
+    replica_id and sharding are keyed on expt_tp/expt_dp, not main TP/DP).
+    Those are excluded upstream by `_is_moe_routed_expert`.
     """
-    # Shape: shard covers full non-prepended region.
     non_prepended_global = tuple(sh_ten.global_shape[sh_ten.prepend_axis_num :])
-    if tuple(sh_ten.local_shape) != non_prepended_global:
-        return False
-    # Replica id: original rid[1] must be the main TP rank.
-    rid = sh_ten.replica_id
-    if not isinstance(rid, tuple) or len(rid) < 2:
-        return False
-    return rid[1] == main_tp_rank
+    return tuple(sh_ten.local_shape) == non_prepended_global
+
+
+def _is_moe_routed_expert(sh_ten: ShardedTensor) -> bool:
+    """Heuristic: is this a routed-MoE expert weight?
+
+    `SequentialMLP` and `TEGroupedMLP` build their expert ShardedTensors with
+    `tp_group=pg_collection.expt_tp` (expert TP) and DP based on expt_dp.
+    Those are *different* groups from main TP/DP, so the "rename per main-TP
+    rank" scheme can't give a consistent classification across main-TP ranks
+    for these tensors — which either breaks the save (partial coverage of
+    `global_shape`) or silently collapses to a single copy.
+
+    Both SequentialMLP and TEGroupedMLP funnel keys through
+    `replace_prefix_for_sharding` so every routed-expert key ends up
+    containing the substring ``'.experts.'`` (typically ``.experts.experts.``
+    after the double-prefix rename; occasionally ``.experts.local_experts.``).
+    Shared experts use ``.shared_experts.`` which does **not** contain
+    ``'.experts.'`` as a substring, so they are correctly allowed through.
+
+    This is a conservative pattern match: false negatives here just mean we
+    miss a rename opportunity (cross-read falls back to the pre-feature
+    behaviour, which is safe). False positives would break save.
+    """
+    return '.experts.' in sh_ten.key
 
 
 def _rename_tp_replicated_keys(
@@ -205,19 +211,18 @@ def _rename_tp_replicated_keys(
     When `save_tp_replicated_copies=True`, each main-TP rank saves its own
     copy of each main-TP-replicated tensor. PyTorch DCP's `MetadataIndex`
     hashes/compares on `(fqn, offset)` only (the `index` hint is excluded),
-    so multiple TP copies with identical `(fqn, offset)` collapse to one entry
-    in `metadata.storage_data`. Making the key unique per main-TP rank
+    so multiple TP copies with identical `(fqn, offset)` collapse to one
+    entry in `metadata.storage_data`. Making the key unique per main-TP rank
     (`fqn` -> `fqn/_tp{main_tp_rank}`) sidesteps that collision entirely — no
-    dedup collective needed. The exact same rename is applied on load so each
-    rank looks up its own copy and reads from its own file.
+    dedup collective needed. The exact same rename is applied on load so
+    each rank looks up its own copy and reads from its own file.
 
     Only `ShardedTensor` is touched; `ShardedObject` (BYTE_IO) is skipped
-    because its metadata slot is one-per-fqn by construction — those stay
-    cross-read, which is acceptable for TE `_extra_state`.
-
-    Must run *before* `_zero_replica_id_tp_dim`: the classifier inspects the
-    original replica_id to tell main-TP-replicated tensors apart from
-    TP-sharded and expert-path tensors that happen to pass the shape check.
+    because its metadata slot is one-per-fqn by construction. Routed-MoE
+    expert ShardedTensors are also skipped — their replica_id and sharding
+    reflect expert-parallel groups (expt_tp/expt_dp), not main TP/DP, and
+    renaming them per main-TP rank yields inconsistent classifications
+    across ranks (causing partial coverage → validator failure).
 
     Args:
         sharded_state_dict: state dict to rewrite in place.
@@ -228,7 +233,9 @@ def _rename_tp_replicated_keys(
     for sh_base in nested_values(sharded_state_dict):
         if not isinstance(sh_base, ShardedTensor):
             continue
-        if not _is_main_tp_replicated(sh_base, main_tp_rank):
+        if _is_moe_routed_expert(sh_base):
+            continue
+        if not _is_main_tp_replicated(sh_base):
             continue
         if reverse:
             if sh_base.key.endswith(suffix):
