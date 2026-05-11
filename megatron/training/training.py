@@ -1640,6 +1640,9 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         and args.cuda_graph_impl == "local"
         and CudaGraphScope.full_iteration in args.cuda_graph_scope
     ):
+        # Run Megatron-FSDP in CUDA graph-safe mode. Avoids some graph-unsafe host-side
+        # operations (such as pointer dereferencing) that can break CUDA graph replay.
+        kwargs["megatron_fsdp_cuda_graph_mode"] = True
         # When using full-iteration CUDA graphs, Megatron-FSDP should not AG parameters
         # during start_param_sync(), which is called during the DistOpt.step(). This
         # causes an error when we wait() on a CUDA kernel launched in a stream beyond
