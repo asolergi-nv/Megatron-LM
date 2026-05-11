@@ -1,25 +1,23 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-import time
+import inspect
 import logging
+import time
 from functools import partial
-from typing import NamedTuple, Callable, Any
+from typing import Any, Callable, NamedTuple
+
+import torch
+
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.config import set_experimental_flag
+from megatron.core.distributed import (
+    DistributedDataParallel,
+    DistributedDataParallelConfig,
+    finalize_model_grads,
+)
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallel as megatron_FSDP,
+)
 from megatron.core.jit import disable_jit_fuser
-from megatron.core.utils import get_model_config
-from megatron.training.checkpointing import load_checkpoint
-from megatron.training.config import PretrainConfigContainer, SchedulerConfig
-from megatron.training.initialize import initialize_megatron, set_jit_fusion_options
-from megatron.training.utils import print_rank_0
-from megatron.training.utils.log_utils import append_to_progress_log, barrier_and_log
-from megatron.training.utils.train_utils import start_memory_history_recording
-import torch
-from megatron.core.transformer import MegatronModule, TransformerConfig
-from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
-from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig, finalize_model_grads
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.optimizer import (
     MegatronOptimizer,
     OptimizerConfig,
@@ -27,8 +25,18 @@ from megatron.core.optimizer import (
     get_mup_config_overrides,
 )
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
-
+from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.rerun_state_machine import RerunDataIterator
+from megatron.core.transformer import MegatronModule, TransformerConfig
+from megatron.core.utils import get_model_config
+from megatron.training.checkpointing import load_checkpoint
+from megatron.training.config import PretrainConfigContainer, SchedulerConfig
+from megatron.training.initialize import initialize_megatron, set_jit_fusion_options
 from megatron.training.state import GlobalState
+from megatron.training.utils import print_rank_0
+from megatron.training.utils.log_utils import append_to_progress_log, barrier_and_log
+from megatron.training.utils.train_utils import start_memory_history_recording
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -231,7 +239,39 @@ def setup(
         pg_collection=pg_collection,
     )
 
-    # TODO (@maanug): data iterator setup
+    # Data stuff.
+    from megatron.training.global_vars import get_args
+    from megatron.training.training import build_train_valid_test_data_iterators
+
+    args = get_args()
+    timers("train/valid/test-data-iterators-setup", log_level=0).start(barrier=True)
+    if args.virtual_pipeline_model_parallel_size is not None:
+        train_data_iterator = []
+        valid_data_iterator = []
+        test_data_iterator = []
+        for vp_stage in range(len(model)):
+            dataset_provider_parameters = inspect.signature(train_valid_test_datasets_provider).parameters
+            assert "vp_stage" in dataset_provider_parameters, (
+                "vp_stage must be a kwarg in train_valid_test_datasets_provider "
+                "when using virtual pipeline parallelism"
+            )
+            vp_stage_train_valid_test_datasets_provider = partial(
+                train_valid_test_datasets_provider, vp_stage=vp_stage
+            )
+            if getattr(train_valid_test_datasets_provider, "is_distributed", False):
+                vp_stage_train_valid_test_datasets_provider.is_distributed = True
+            iterators = build_train_valid_test_data_iterators(
+                vp_stage_train_valid_test_datasets_provider
+            )
+            train_data_iterator.append(iterators[0])
+            valid_data_iterator.append(iterators[1])
+            test_data_iterator.append(iterators[2])
+    else:
+        train_data_iterator, valid_data_iterator, test_data_iterator = (
+            build_train_valid_test_data_iterators(train_valid_test_datasets_provider)
+        )
+    timers("train/valid/test-data-iterators-setup").stop()
+    barrier_and_log("after dataloaders are built")
 
     print_rank_0("done with setup ...")
     timers.log(["model-and-optimizer-setup", "train/valid/test-data-iterators-setup"], barrier=True)
@@ -241,12 +281,9 @@ def setup(
         model,
         optimizer,
         scheduler,
-        # train_data_iterator,
-        None,
-        # valid_data_iterator,
-        None,
-        # test_data_iterator,
-        None,
+        train_data_iterator,
+        valid_data_iterator,
+        test_data_iterator,
         # checkpoint_manager,
         pg_collection,
     )
@@ -269,8 +306,8 @@ def _build_distributed_model(cfg: PretrainConfigContainer, pg_collection: Proces
             data_parallel_random_init=cfg.rng.data_parallel_random_init,
         )
     else:
-        from megatron.training.training import get_model
         from megatron.training.global_vars import get_args
+        from megatron.training.training import get_model
 
         args = get_args()
         has_normal_optimizer = not args.skip_train
