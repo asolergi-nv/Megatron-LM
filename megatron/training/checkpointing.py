@@ -1520,7 +1520,15 @@ def _load_base_checkpoint(
 
         ckpt_type = CheckpointType.FSDP_DTENSOR
         with trace_region("FileSystemReader"):
-            fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
+            if getattr(args, 'ckpt_fsdp_dtensor_cache_metadata', False):
+                # Cache the .metadata read so the explicit diff read and the read
+                # inside load_state_dict share a single storage interaction.
+                from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
+                    CachedMetadataFileSystemReader,
+                )
+                fs_storage_reader = CachedMetadataFileSystemReader(checkpoint_name)
+            else:
+                fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
         allow_partial_load = not getattr(args, 'strict_fsdp_dtensor_load', False)
         if allow_partial_load:
             with trace_region("read_metadata_and_diff"):

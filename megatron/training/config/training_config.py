@@ -568,6 +568,14 @@ class CheckpointConfig:
     dedicated run with this flag to generate the cache, then run without it (read mode) for fast
     collective-free save/load."""
 
+    ckpt_fsdp_dtensor_cache_metadata: bool = False
+    """Opt-in: use a CachedMetadataFileSystemReader for fsdp_dtensor checkpoint loads. The load path
+    reads the checkpoint .metadata file twice with a plain FileSystemReader -- once explicitly (to diff
+    against the requested state dict when --strict-fsdp-dtensor-load is disabled) and once internally
+    inside torch.distributed.checkpoint.load_state_dict. Enabling this caches the metadata after the
+    first read (keyed by checkpoint path), so the second read returns it with no storage interaction,
+    mirroring how the torch_dist format avoids the redundant read."""
+
     dist_ckpt_strictness: Literal[
         "assume_ok_unexpected",
         "log_unexpected",
