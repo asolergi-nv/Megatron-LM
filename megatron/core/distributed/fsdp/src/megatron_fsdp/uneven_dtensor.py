@@ -93,11 +93,18 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
     return ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(local_shape))
 
 
-def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
+def attach_uneven_chunk_closures(
+    dtensor: DTensor, uneven_chunk_meta: ChunkStorageMetadata
+) -> None:
     """
-    Update the DTensor's chunk metadata to handle uneven sharding.
-    This function modifies the DTensor in-place to include chunk metadata
-    and write items closures for saving and loading.
+    Attach the DCP chunk-list and write-items closures to a DTensor given an
+    already-computed ``ChunkStorageMetadata``.
+
+    This is the *collective-free* tail of ``update_uneven_dtensor_chunk_metadata``:
+    it only wires the closures and performs no communication. It is factored out
+    so that a cached code path (see ``preprocess_state_dict_for_uneven_dtensor_from_cache``)
+    can reuse the exact same closure construction without re-running the
+    ``all_gather`` that produced ``uneven_chunk_meta``.
     """
 
     def _chunk_list_closure(chunk_meta):
@@ -123,6 +130,17 @@ def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
 
         return _write_items
 
+    # Set the chunk list and write items closure for the DTensor
+    dtensor._local_tensor.__create_chunk_list__ = _chunk_list_closure([uneven_chunk_meta])
+    dtensor._local_tensor.__create_write_items__ = _write_items_closure(uneven_chunk_meta)
+
+
+def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
+    """
+    Update the DTensor's chunk metadata to handle uneven sharding.
+    This function modifies the DTensor in-place to include chunk metadata
+    and write items closures for saving and loading.
+    """
     # Get uneven chunk metadata for the DTensor
     # TODO: Optimize gather_and_compute_chunk_metadata synchronization:
     # 1. Add pre-check validation to verify tensor shape consistency
@@ -131,9 +149,7 @@ def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
     #    to amortize synchronization overhead
     uneven_chunk_meta = gather_and_compute_chunk_metadata(dtensor)
 
-    # Set the chunk list and write items closure for the DTensor
-    dtensor._local_tensor.__create_chunk_list__ = _chunk_list_closure([uneven_chunk_meta])
-    dtensor._local_tensor.__create_write_items__ = _write_items_closure(uneven_chunk_meta)
+    attach_uneven_chunk_closures(dtensor, uneven_chunk_meta)
 
 
 def validate_uneven_dtensor(dtensor: DTensor) -> None:
@@ -250,6 +266,59 @@ def preprocess_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
         # Get the DTensor at the key chain
         dtensor = get_unflattened_state_dict(state_dict, key_chain)
         update_uneven_dtensor_chunk_metadata(dtensor)
+    return state_dict
+
+
+def extract_uneven_chunk_metadata_cache(state_dict: dict) -> dict:
+    """
+    Read back the per-DTensor chunk metadata that
+    ``preprocess_state_dict_for_uneven_dtensor`` attached, as a plain,
+    picklable cache: ``{tuple(key_chain): (offsets, sizes)}``.
+
+    Must be called *after* ``preprocess_state_dict_for_uneven_dtensor`` (or any
+    path that attaches ``__create_chunk_list__``) on the same ``state_dict``.
+    The returned dict is what gets persisted to disk so future save/load calls
+    can skip the ``all_gather`` collectives entirely. ``offsets`` is the only
+    collective-derived quantity; ``sizes`` is stored alongside purely so the
+    cache can self-validate against the live local shapes on read.
+    """
+    visit_dtensor = filter_unflattened_state_dict(
+        state_dict, visit_condition=lambda x: isinstance(x, DTensor)
+    )
+    cache = {}
+    for key_chain in sorted(visit_dtensor):
+        dtensor = get_unflattened_state_dict(state_dict, key_chain)
+        chunk_meta = dtensor._local_tensor.__create_chunk_list__()[0]
+        cache[tuple(key_chain)] = (tuple(chunk_meta.offsets), tuple(chunk_meta.sizes))
+    return cache
+
+
+def preprocess_state_dict_for_uneven_dtensor_from_cache(state_dict: dict, cache: dict) -> dict:
+    """
+    Collective-free equivalent of ``preprocess_state_dict_for_uneven_dtensor``
+    that uses cached ``offsets`` instead of recomputing them with ``all_gather``.
+
+    For each DTensor it rebuilds ``ChunkStorageMetadata(offsets=<cached>,
+    sizes=<live local shape>)`` and attaches the same closures via
+    ``attach_uneven_chunk_closures``. ``sizes`` is taken from the live tensor
+    rather than the cache so the attached metadata always reflects the actual
+    local shard (the two are equal whenever the cache matches the current run).
+
+    The cache is assumed to correspond to the current (model config, parallelism
+    config, world size); the caller selects this path explicitly (e.g. via a CLI
+    flag) so it is taken on *all* ranks together. The closure attachment itself
+    performs no communication.
+    """
+    visit_dtensor = filter_unflattened_state_dict(
+        state_dict, visit_condition=lambda x: isinstance(x, DTensor)
+    )
+    for key_chain in sorted(visit_dtensor):
+        dtensor = get_unflattened_state_dict(state_dict, key_chain)
+        cached_offsets, _ = cache[tuple(key_chain)]
+        uneven_chunk_meta = ChunkStorageMetadata(
+            offsets=tuple(cached_offsets), sizes=tuple(dtensor.to_local().shape)
+        )
+        attach_uneven_chunk_closures(dtensor, uneven_chunk_meta)
     return state_dict
 
 

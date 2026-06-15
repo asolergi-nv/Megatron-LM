@@ -551,6 +551,23 @@ class CheckpointConfig:
     strict_fsdp_dtensor_load: bool = True
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
 
+    ckpt_fsdp_dtensor_cache_path: Optional[str] = None
+    """Opt-in directory for the uneven-DTensor chunk-metadata cache used by the fsdp_dtensor checkpoint
+    format. The default path recomputes this metadata on every save and load via a blocking
+    all_gather_object per sharded mesh dimension per DTensor (thousands of tiny collectives for large
+    MoE models). The metadata is a deterministic, value-independent function of (model config,
+    parallelism config, world size) and is identical on save and load. When this path is set, the cache
+    is read straight from disk (no collectives, no existence checks) and used to reconstruct the chunk
+    metadata locally. Setting this path assumes a valid cache already exists at it (see
+    --ckpt-fsdp-dtensor-cache-create to populate one); a missing per-rank file raises at load time."""
+
+    ckpt_fsdp_dtensor_cache_create: bool = False
+    """Populate (write) the uneven-DTensor chunk-metadata cache instead of reading it. Requires
+    --ckpt-fsdp-dtensor-cache-path. In this mode the metadata is computed via the normal collective
+    path and each rank writes its own cache file under the cache path; the cache is not read. Use a
+    dedicated run with this flag to generate the cache, then run without it (read mode) for fast
+    collective-free save/load."""
+
     dist_ckpt_strictness: Literal[
         "assume_ok_unexpected",
         "log_unexpected",

@@ -35,9 +35,16 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
 )
+from megatron.core.dist_checkpointing.strategies.torch_dcp_load_trace import (
+    apply_torch_dcp_load_trace_patch,
+)
+from megatron.core.dist_checkpointing.strategies.torch_dcp_save_trace import (
+    apply_torch_dcp_save_trace_patch,
+)
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.perfetto_trace import trace_region
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
 
@@ -50,7 +57,9 @@ from .utils import append_to_progress_log, is_last_rank, print_rank_0
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        extract_uneven_chunk_metadata_cache,
         preprocess_state_dict_for_uneven_dtensor,
+        preprocess_state_dict_for_uneven_dtensor_from_cache,
     )
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
         handle_experts_in_state_dict,
@@ -492,6 +501,7 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
                  f"from iteration {iteration:7d}")
 
 
+@trace_region("save_checkpoint")
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
                     train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
@@ -690,7 +700,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 ensure_directory_exists(checkpoint_name, check_parent=False)
 
             if ckpt_format == "fsdp_dtensor":
-                state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+                with trace_region("preprocess_fsdp_dtensor_state_dict"):
+                    state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+
+            # Break open the PyTorch DCP save internals (planner / storage writer /
+            # _DistWrapper collectives) on the Perfetto trace. No-op unless
+            # CKPT_PERFETTO_TRACE=1.
+            apply_torch_dcp_save_trace_patch()
 
             if args.async_save:
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
@@ -712,25 +728,29 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                             "use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext "
                             "to use --async-ckpt-use-cpu-shm."
                         )
-                fs_storage_writer = FileSystemWriterAsync(
-                    checkpoint_name,
-                    thread_count=args.dist_ckpt_workers,
-                    use_msc=args.enable_msc,
-                    **_writer_kwargs,
-                )
+                with trace_region("FileSystemWriterAsync"):
+                    fs_storage_writer = FileSystemWriterAsync(
+                        checkpoint_name,
+                        thread_count=args.dist_ckpt_workers,
+                        use_msc=args.enable_msc,
+                        **_writer_kwargs,
+                    )
 
-                save_state_dict_ret = save_state_dict_async_plan(
-                    state_dict, fs_storage_writer, None, coordinator_rank, planner=planner, enable_cache=args.ckpt_assume_constant_structure
-                )
-                async_save_request = get_save_and_finalize_callbacks(
-                    fs_storage_writer, save_state_dict_ret, args.async_strategy
-                )
+                with trace_region("save_state_dict_async_plan"):
+                    save_state_dict_ret = save_state_dict_async_plan(
+                        state_dict, fs_storage_writer, None, coordinator_rank, planner=planner, enable_cache=args.ckpt_assume_constant_structure
+                    )
+                with trace_region("get_save_and_finalize_callbacks"):
+                    async_save_request = get_save_and_finalize_callbacks(
+                        fs_storage_writer, save_state_dict_ret, args.async_strategy
+                    )
             else:
                 fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
-                torch.distributed.checkpoint.save(
-                    state_dict=state_dict,
-                    storage_writer=fs_storage_writer,
-                )
+                with trace_region("checkpoint.save"):
+                    torch.distributed.checkpoint.save(
+                        state_dict=state_dict,
+                        storage_writer=fs_storage_writer,
+                    )
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
             if has_nvidia_modelopt:
@@ -1085,9 +1105,91 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
             state_dict["model"] = model_state_dict
     if args.num_experts:
         state_dict["model"] = handle_experts_in_state_dict(state_dict["model"], args.num_experts)
-    preprocess_state_dict_for_uneven_dtensor(state_dict)
+
+    with trace_region("preprocess_state_dict_for_uneven_dtensor"):
+        _preprocess_uneven_dtensor(args, state_dict)
 
     return state_dict
+
+
+def _uneven_dtensor_cache_file(cache_path):
+    """Per-rank file path for the uneven-DTensor chunk-metadata cache.
+
+    ``offsets`` are rank-specific, so each rank reads/writes its own file. The
+    files live directly under the user-provided ``--ckpt-fsdp-dtensor-cache-path``
+    alongside the per-rank ``.distcp`` shards, matching how distributed
+    checkpoints already store one file per rank.
+    """
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    return os.path.join(cache_path, f"uneven_dtensor_cache_rank{rank}.pt")
+
+
+# Process-lifetime memo of the uneven-DTensor chunk metadata. The offsets depend
+# only on (model config, parallelism config, world size), which are fixed for the
+# whole job, so once we have them — computed via collectives in create mode, or
+# read from disk in read mode — every later save/load reconstructs from this dict
+# with no collectives and no further disk reads. ``None`` until the first call.
+_UNEVEN_DTENSOR_CHUNK_METADATA_CACHE = None
+
+
+def _preprocess_uneven_dtensor(args, state_dict):
+    """Preprocess uneven DTensors, optionally via a CLI-selected cache.
+
+    The default ``preprocess_state_dict_for_uneven_dtensor`` issues a blocking
+    ``all_gather_object`` per sharded mesh dimension per DTensor (thousands of
+    tiny collectives for large MoE models). The chunk metadata it produces is a
+    deterministic, value-independent function of the sharding layout, identical
+    on save and load — so it can be computed once and reused.
+
+    The path taken is decided **purely from the CLI** (no collectives, no
+    filesystem probing), so it is trivially identical on every rank:
+
+    * ``--ckpt-fsdp-dtensor-cache-path`` unset → default collective path on every
+      call.
+    * path set + ``--ckpt-fsdp-dtensor-cache-create`` → **populate mode**: the
+      *first* call computes via collectives and writes each rank's cache file;
+      it also memoizes the metadata in-process.
+    * path set, create unset → **read mode**: the *first* call loads this rank's
+      cache file (assumed to exist and be correct; a missing file raises) and
+      memoizes it.
+
+    In both cache modes every call *after the first* reconstructs the closures
+    from the in-process memo — so e.g. populating the cache on the load at job
+    start means the periodic saves that follow trigger no collectives (and no
+    repeated disk reads). This assumes the DTensor set of the first call covers
+    later calls, which holds because save and load share the same layout.
+    """
+    global _UNEVEN_DTENSOR_CHUNK_METADATA_CACHE
+
+    cache_path = getattr(args, "ckpt_fsdp_dtensor_cache_path", None)
+
+    if not cache_path:
+        preprocess_state_dict_for_uneven_dtensor(state_dict)
+        return
+
+    # After the first call the metadata is known for the rest of the job.
+    if _UNEVEN_DTENSOR_CHUNK_METADATA_CACHE is not None:
+        preprocess_state_dict_for_uneven_dtensor_from_cache(
+            state_dict, _UNEVEN_DTENSOR_CHUNK_METADATA_CACHE
+        )
+        return
+
+    cache_file = _uneven_dtensor_cache_file(cache_path)
+
+    if getattr(args, "ckpt_fsdp_dtensor_cache_create", False):
+        # First call: compute via the collective path, persist per rank, memoize.
+        preprocess_state_dict_for_uneven_dtensor(state_dict)
+        _UNEVEN_DTENSOR_CHUNK_METADATA_CACHE = extract_uneven_chunk_metadata_cache(state_dict)
+        os.makedirs(cache_path, exist_ok=True)
+        torch.save(_UNEVEN_DTENSOR_CHUNK_METADATA_CACHE, cache_file)
+        return
+
+    # First call, read mode: load this rank's file (assumed present + correct),
+    # memoize, and reconstruct. No collectives, no existence checks.
+    _UNEVEN_DTENSOR_CHUNK_METADATA_CACHE = torch.load(cache_file, weights_only=False)
+    preprocess_state_dict_for_uneven_dtensor_from_cache(
+        state_dict, _UNEVEN_DTENSOR_CHUNK_METADATA_CACHE
+    )
 
 
 def _transpose_first_dim(t, num_splits, num_splits_first, model):
@@ -1413,24 +1515,33 @@ def _load_base_checkpoint(
         raw_optimizer_state_dict = state_dict["optimizer"].copy() if "optimizer" in state_dict else None
         raw_model_state_dict = state_dict["model"].copy() if "model" in state_dict else None
         model = state_dict.pop("_model")
-        state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+        with trace_region("preprocess_fsdp_dtensor_state_dict"):
+            state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
 
         ckpt_type = CheckpointType.FSDP_DTENSOR
-        fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
+        with trace_region("FileSystemReader"):
+            fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
         allow_partial_load = not getattr(args, 'strict_fsdp_dtensor_load', False)
         if allow_partial_load:
-            state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
-            rank = torch.distributed.get_rank()
-            import time as _time
-            _time.sleep(rank * 0.001)  # Make that logs of different ranks do not overlap
-            print_diff_in_state_dicts(state_dict_metadata, state_dict)
+            with trace_region("read_metadata_and_diff"):
+                state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
+                rank = torch.distributed.get_rank()
+                import time as _time
+                _time.sleep(rank * 0.001)  # Make that logs of different ranks do not overlap
+                print_diff_in_state_dicts(state_dict_metadata, state_dict)
+
+        # Break open the PyTorch DCP load internals (read_metadata / planner /
+        # read_data / _DistWrapper collectives) on the Perfetto trace. No-op
+        # unless CKPT_PERFETTO_TRACE=1.
+        apply_torch_dcp_load_trace_patch()
 
         planner = default_planner.DefaultLoadPlanner(allow_partial_load=allow_partial_load)
-        torch.distributed.checkpoint.load_state_dict(
-            state_dict=state_dict,
-            storage_reader=fs_storage_reader,
-            planner=planner,
-        )
+        with trace_region("load_state_dict"):
+            torch.distributed.checkpoint.load_state_dict(
+                state_dict=state_dict,
+                storage_reader=fs_storage_reader,
+                planner=planner,
+            )
 
         if raw_optimizer_state_dict is not None:
             state_dict["optimizer"] = raw_optimizer_state_dict
@@ -1610,6 +1721,7 @@ def load_args_from_checkpoint(
     return args, checkpoint_args
 
 
+@trace_region("load_checkpoint")
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
                     checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
     """Load a model checkpoint and return the iteration.

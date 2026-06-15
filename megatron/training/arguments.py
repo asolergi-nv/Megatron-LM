@@ -1506,6 +1506,11 @@ def validate_args(args, defaults={}):
     if args.ckpt_format == "fsdp_dtensor":
         assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
+    # The uneven-DTensor metadata cache populate mode needs a destination directory.
+    if args.ckpt_fsdp_dtensor_cache_create:
+        assert args.ckpt_fsdp_dtensor_cache_path, \
+            "--ckpt-fsdp-dtensor-cache-create requires --ckpt-fsdp-dtensor-cache-path."
+
     # Data blend checks
     assert args.mock_data + \
            bool(args.data_path) + \
