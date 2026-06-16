@@ -262,6 +262,32 @@ def get_load_checkpoint_path_by_args(args, load_arg="load"):
     return get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
 
 
+def _get_fsdp_dtensor_storage_reader(args, path):
+    """Build the FileSystemReader for an fsdp_dtensor load, optionally caching metadata.
+
+    A single fsdp_dtensor load calls ``read_metadata()`` on the same checkpoint
+    directory several times: once in ``load_checkpoint`` (to decide what to put in
+    the generated state dict), optionally once in ``_load_base_checkpoint`` (the
+    partial-load diff, only when ``--strict-fsdp-dtensor-load`` is disabled), and
+    once inside ``torch.distributed.checkpoint.load_state_dict``. With a plain
+    ``FileSystemReader`` each call re-reads the ``.metadata`` file from storage.
+
+    When ``--ckpt-fsdp-dtensor-cache-metadata`` is set this returns a
+    ``CachedMetadataFileSystemReader`` whose cache is class-level and keyed by the
+    (absolute) checkpoint path. Because ``load_checkpoint`` and
+    ``_load_base_checkpoint`` resolve to the *same* iteration directory, the first
+    read populates the cache and every later read on that path — including the one
+    inside ``load_state_dict`` — is served from memory with no storage interaction.
+    This mirrors how the ``torch_dist`` format avoids redundant metadata reads.
+    """
+    if getattr(args, 'ckpt_fsdp_dtensor_cache_metadata', False):
+        from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
+            CachedMetadataFileSystemReader,
+        )
+        return CachedMetadataFileSystemReader(path)
+    return FileSystemReader(path)
+
+
 def get_distributed_optimizer_checkpoint_name(model_checkpoint_name):
     return os.path.join(os.path.dirname(model_checkpoint_name),
                         "distrib_optim.pt")
@@ -1520,15 +1546,7 @@ def _load_base_checkpoint(
 
         ckpt_type = CheckpointType.FSDP_DTENSOR
         with trace_region("FileSystemReader"):
-            if getattr(args, 'ckpt_fsdp_dtensor_cache_metadata', False):
-                # Cache the .metadata read so the explicit diff read and the read
-                # inside load_state_dict share a single storage interaction.
-                from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
-                    CachedMetadataFileSystemReader,
-                )
-                fs_storage_reader = CachedMetadataFileSystemReader(checkpoint_name)
-            else:
-                fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
+            fs_storage_reader = _get_fsdp_dtensor_storage_reader(args, checkpoint_name)
         allow_partial_load = not getattr(args, 'strict_fsdp_dtensor_load', False)
         if allow_partial_load:
             with trace_region("read_metadata_and_diff"):
@@ -1927,9 +1945,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         }
         load_kwargs["sharded_state_dict"] = sharded_state_dict
     elif args.ckpt_format == "fsdp_dtensor":
-        reader = FileSystemReader(get_load_checkpoint_path_by_args(args))
+        reader = _get_fsdp_dtensor_storage_reader(args, get_load_checkpoint_path_by_args(args))
         try:
-            state_dict_metadata = reader.read_metadata().state_dict_metadata
+            with trace_region("read_metadata"):
+                state_dict_metadata = reader.read_metadata().state_dict_metadata
         except FileNotFoundError:
             state_dict_metadata = {}
 
@@ -1950,16 +1969,17 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
         optim_sd_kwargs = dict(metadata=_build_sharded_state_dict_metadata(args), is_loading=True)
 
-        state_dict = generate_state_dict(
-            args,
-            model=model,
-            optimizer=gen_sd_optim,
-            opt_param_scheduler=gen_sd_opt_param_scheduler,
-            rng_state=gen_sd_rng_state,
-            optim_sd_kwargs=optim_sd_kwargs,
-            rerun_state=gen_sd_rerun_state,
-            iteration=1,
-        )
+        with trace_region("generate_state_dict"):
+            state_dict = generate_state_dict(
+                args,
+                model=model,
+                optimizer=gen_sd_optim,
+                opt_param_scheduler=gen_sd_opt_param_scheduler,
+                rng_state=gen_sd_rng_state,
+                optim_sd_kwargs=optim_sd_kwargs,
+                rerun_state=gen_sd_rerun_state,
+                iteration=1,
+            )
         state_dict["_model"] = model
         load_kwargs["sharded_state_dict"] = state_dict
 
