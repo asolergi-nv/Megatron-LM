@@ -386,3 +386,102 @@ class TestStreamCkptDequant:
         wrapped_on = FullyParallelLoadStrategyWrapper(base_on)
         assert wrapped_off.stream_ckpt_dequant is False
         assert wrapped_on.stream_ckpt_dequant is True
+
+    # ---------------------------------------------------------------
+    # Regression: resharding load (checkpoint geometry != load geometry)
+    # ---------------------------------------------------------------
+
+    @pytest.mark.skipif(
+        Utils.world_size < 2, reason="Resharding needs at least 2 ranks to split an axis"
+    )
+    @pytest.mark.parametrize('save_axis,load_axis', [(0, 0), (0, 1), (1, 0)])
+    def test_reshard_matches_legacy_path(self, tmp_path_dist_ckpt, save_axis, load_axis):
+        """Streaming and legacy loads must agree bit-for-bit when the checkpoint reshards.
+
+        Regression test for the case the original streaming implementation got wrong.
+        DCP's ``narrow_tensor_by_index`` only narrows a dimension when the read item is
+        smaller than the destination, so when save-time and load-time shard geometry
+        agree, every destination is covered by a single full-size read item and
+        "quantize per read item" is trivially identical to "quantize the whole tensor".
+        Only a *resharding* load produces partial read items, and that is where the two
+        paths used to diverge — silently, in three different ways:
+
+          * a partial narrow on a non-leading dim yields a non-contiguous quantized
+            view whose ``copy_`` does not write, dropping the data;
+          * for data-derived scales (current scaling, block scales) a partial
+            quantize-copy re-derives and overwrites the tensor-wide scale, corrupting
+            the regions written by earlier read items;
+          * ``MXFP8Tensor``/``Float8BlockwiseQTensor`` only implement the no-op slice,
+            so a partial narrow returns a dequantized temporary that does not alias the
+            parameter and the loaded bytes are discarded.
+
+        The three parameter pairs are chosen to cover distinct mechanisms:
+          * ``(0, 0)`` -- aligned control; a single full-cover read item, must pass
+            both before and after the fix.
+          * ``(0, 1)`` -- reshard whose partial narrow lands on dim 0, leaving the
+            quantized view contiguous.
+          * ``(1, 0)`` -- reshard whose partial narrow lands on dim 1, producing a
+            *non-contiguous* quantized view. This is the direction that actually
+            regressed for delayed scaling, so omitting it makes the test vacuous.
+
+        Random data is essential here: the other tests in this file fill tensors with a
+        single exactly-representable constant, which gives every sub-region the same
+        amax and therefore hides any scale-granularity change.
+        """
+        Utils.initialize_model_parallel(1, 1)
+        world = Utils.world_size
+        n = 64 * world
+
+        torch.manual_seed(1234)
+        full = torch.randn(n, n, dtype=torch.bfloat16, device='cuda')
+        # Wide dynamic range between the halves: with any shared scale, deriving it
+        # from the wrong subset becomes unmistakable rather than a rounding artefact.
+        full[: n // 2] *= 32.0
+
+        chunk = n // world
+        save_sl = [slice(None), slice(None)]
+        save_sl[save_axis] = slice(Utils.rank * chunk, (Utils.rank + 1) * chunk)
+        save_slice = full[tuple(save_sl)].contiguous()
+
+        dst_sl = [slice(None), slice(None)]
+        dst_sl[load_axis] = slice(Utils.rank * chunk, (Utils.rank + 1) * chunk)
+        truth = full[tuple(dst_sl)].contiguous()
+
+        with TempNamedDir(tmp_path_dist_ckpt / f'reshard_{save_axis}{load_axis}') as ckpt_dir:
+            save(
+                {
+                    'w': ShardedTensor.from_rank_offsets(
+                        'w', save_slice, (save_axis, Utils.rank, world)
+                    )
+                },
+                ckpt_dir,
+                TorchDistSaveShardedStrategy('torch_dist', 1),
+            )
+
+            results = {}
+            for stream in (False, True):
+                # Sentinel fill unrelated to the checkpoint, so a silently skipped
+                # load shows up as a large error instead of passing by luck.
+                dst = _to_float8(torch.full_like(truth, -99.0))
+                loaded = load(
+                    {
+                        'w': ShardedTensor.from_rank_offsets(
+                            'w', dst, (load_axis, Utils.rank, world)
+                        )
+                    },
+                    ckpt_dir,
+                    TorchDistLoadShardedStrategy(stream_ckpt_dequant=stream),
+                )['w']
+                # Mirrors megatron/training/checkpointing.py, which finishes the load
+                # with module.load_state_dict() -> param.copy_(loaded).
+                dst.copy_(loaded)
+                results[stream] = dst.dequantize().clone()
+
+            # Both paths quantize, so neither equals `truth` exactly; requiring them to
+            # equal *each other* exactly is the real invariant.
+            assert torch.equal(results[False], results[True]), (
+                "streaming and legacy dequant paths disagree under resharding: "
+                f"max|diff|={(results[False] - results[True]).abs().max().item()}"
+            )
+            # And both must actually reflect the checkpoint rather than the sentinel.
+            assert (results[True] - truth).abs().max() < 0.5 * full.abs().max()
