@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Un
 import torch
 from packaging.version import Version as PkgVersion
 from torch.distributed import checkpoint
+from torch.distributed._shard._utils import narrow_tensor_by_index
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import Shard
 from torch.distributed._shard.sharded_tensor import ShardedTensor as TorchShardedTensor
@@ -515,6 +516,20 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         self._intermediate_read_items: Dict[
             int, Tuple[ReadItem, torch.Tensor, Optional[torch.Tensor], str]
         ] = {}
+        # Streaming dequant state, keyed by `read_item.dest_index` (i.e. per
+        # destination tensor, NOT per read item). Values are
+        # (quantized_destination, high_precision_scratch, amax_snapshot_or_None).
+        # A destination may be covered by several read items when the checkpoint's
+        # shard geometry differs from the load-time geometry; the scratch is shared
+        # across them and quantized back exactly once, when the last one commits.
+        self._stream_dequant_buffers: Dict[
+            Any, Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
+        ] = {}
+        # Remaining uncommitted read items per destination, populated in
+        # `finish_plan`. Needed because DCP gives no "destination complete"
+        # callback, and quantizing back on every read item is what makes partial
+        # loads lossy.
+        self._stream_dequant_pending: Dict[Any, int] = {}
 
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
@@ -567,6 +582,45 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
 
         return local_plan
 
+    def finish_plan(self, new_plan: LoadPlan) -> LoadPlan:
+        """Counts read items per destination on the plan this rank will actually execute.
+
+        The per-destination read-item count is what lets ``commit_tensor`` know when a
+        destination tensor is fully loaded. DCP offers no such signal: it calls
+        ``resolve_tensor``/``commit_tensor`` once per read item and never announces that a
+        destination is complete.
+
+        Counting happens here rather than in ``create_local_plan`` because the plan
+        returned by ``create_local_plan`` is not necessarily the one executed — it goes
+        through ``create_global_plan`` on the coordinator first, and ``finish_plan``
+        receives the final, possibly rewritten, plan. Counting the wrong plan would make
+        ``commit_tensor`` quantize back too early and reintroduce the partial-load bug.
+        """
+        final_plan = super().finish_plan(new_plan)
+
+        self._stream_dequant_pending = {}
+        for read_item in final_plan.items:
+            key = read_item.dest_index
+            self._stream_dequant_pending[key] = self._stream_dequant_pending.get(key, 0) + 1
+
+        return final_plan
+
+    def _covers_whole_destination(self, read_item: ReadItem, dest: torch.Tensor) -> bool:
+        """True if this read item is the only one for ``dest`` and spans all of it.
+
+        Used purely as an optimization: when it holds, every element of the scratch
+        is about to be overwritten, so the buffer can be left uninitialized instead
+        of paying for a full dequantize of the destination. It must be conservative
+        — returning True wrongly would leak uninitialized memory into weights — so it
+        requires the read-item count to be exactly one *and* the item to start at the
+        origin and match the destination's shape on every dimension.
+        """
+        if self._stream_dequant_pending.get(read_item.dest_index, 0) != 1:
+            return False
+        return all(o == 0 for o in read_item.dest_offsets) and tuple(read_item.lengths) == tuple(
+            dest.shape
+        )
+
     def resolve_tensor(self, read_item: ReadItem):
         """Override to add quantized-tensor support.
 
@@ -575,51 +629,79 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         1. Streaming per-tensor dequantize (when ``stream_ckpt_dequant`` is True
            and the destination is a TE ``QuantizedTensor`` — covers Float8,
            MXFP8, blockwise FP8, and NVFP4 via the common base class). We
-           allocate a per-tensor high-precision scratch buffer, return it as
-           the load destination, and quantize-copy it back into the original
-           tensor in ``commit_tensor``. This replaces the upfront bulk
-           dequantize done by ``force_all_tensors_to_non_fp8`` and keeps at
-           most one scratch tensor live at a time.
+           allocate one high-precision scratch buffer for the whole destination
+           tensor, hand DCP a narrowed view *of that scratch*, and quantize-copy
+           the scratch back into the destination in ``commit_tensor`` once every
+           read item targeting it has committed. This replaces the upfront bulk
+           dequantize done by ``force_all_tensors_to_non_fp8`` and keeps at most
+           one scratch per in-flight destination live at a time.
+
+           The scratch is per *destination*, not per *read item*, and is resolved
+           before any narrowing. Both details are load-bearing:
+
+           * Quantizing at read-item granularity changes what the scale is derived
+             from. For recipes whose scale comes from the data (FP8 current
+             scaling, MXFP8/blockwise/NVFP4 block scales) a partial quantize-copy
+             re-derives and overwrites the scale, silently corrupting the regions
+             written by earlier read items.
+           * Narrowing a quantized tensor is not generally a view. ``MXFP8Tensor``
+             and ``Float8BlockwiseQTensor`` only implement the *no-op* slice
+             (``start == 0 and length == size``); a genuine partial slice falls
+             through to ``QuantizedTensor.__torch_dispatch__``, which returns a
+             dequantized *temporary* that does not alias the parameter — so the
+             loaded bytes would be silently discarded. Narrowing the
+             high-precision scratch instead is always a real view.
 
         2. Non-contiguous Float8 fix: narrowing a Float8Tensor can produce a
            non-contiguous view for which no ``copy_`` kernel exists. We fall
            back to a contiguous Float8 clone and copy it back in
-           ``commit_tensor``.
+           ``commit_tensor``. This remains reachable only when streaming is
+           disabled, since streaming never hands DCP a quantized destination.
 
-        Both cases stash state in ``self._intermediate_read_items``, keyed by
-        ``id(read_item)``, so ``commit_tensor`` can undo them.
+        Both cases stash state so ``commit_tensor`` can undo them.
         """
-        target_tensor = super().resolve_tensor(read_item)
-
         # Lazy import to avoid circular imports (fp8_utils pulls in core.tensor_parallel).
         from ...fp8_utils import is_float8tensor as _is_quantized_tensor
 
-        if (
-            self.stream_ckpt_dequant
-            and HAVE_TE
-            and _is_quantized_tensor(target_tensor)
-            and target_tensor.is_cuda
-        ):
-            # Snapshot amax for delayed-scaling quantizers so the subsequent
-            # BF16->FP8 quantize-copy does not pollute amax_history. For
-            # current-scaling / MXFP8 / blockwise / NVFP4 quantizers, amax is
-            # None or absent on the quantizer and the snapshot is a no-op.
-            amax_snapshot: Optional[torch.Tensor] = None
-            quantizer = getattr(target_tensor, "_quantizer", None)
-            amax = getattr(quantizer, "amax", None) if quantizer is not None else None
-            if isinstance(amax, torch.Tensor):
-                amax_snapshot = amax.detach().clone()
+        if self.stream_ckpt_dequant and HAVE_TE:
+            # Resolve the *un-narrowed* destination first. `super().resolve_tensor`
+            # would narrow it, and narrowing is exactly what destroys the quantized
+            # type for MXFP8/blockwise (see above), so the check has to happen here.
+            dest = self.lookup_tensor(read_item.dest_index)
+            if _is_quantized_tensor(dest) and dest.is_cuda:
+                key = read_item.dest_index
+                entry = self._stream_dequant_buffers.get(key)
+                if entry is None:
+                    # Snapshot amax for delayed-scaling quantizers so the eventual
+                    # BF16->FP8 quantize-copy does not pollute amax_history. For
+                    # current-scaling / MXFP8 / blockwise / NVFP4 quantizers, amax is
+                    # None or absent on the quantizer and the snapshot is a no-op.
+                    amax_snapshot: Optional[torch.Tensor] = None
+                    quantizer = getattr(dest, "_quantizer", None)
+                    amax = getattr(quantizer, "amax", None) if quantizer is not None else None
+                    if isinstance(amax, torch.Tensor):
+                        amax_snapshot = amax.detach().clone()
 
-            scratch = torch.empty(
-                target_tensor.shape, dtype=target_tensor.dtype, device=target_tensor.device
-            )
-            self._intermediate_read_items[id(read_item)] = (
-                read_item,
-                target_tensor,
-                amax_snapshot,
-                "stream",
-            )
-            return scratch
+                    # Seed the scratch with the destination's current values unless
+                    # this load is guaranteed to overwrite every element. Read items
+                    # need not cover the destination in full (e.g. a checkpoint saved
+                    # with a smaller global shape under `allow_shape_mismatch`), and
+                    # uncovered regions must keep their prior contents rather than
+                    # pick up uninitialized memory. In the overwhelmingly common
+                    # single-full-cover case the dequantize is pure waste, so skip it.
+                    if self._covers_whole_destination(read_item, dest):
+                        scratch = torch.empty(dest.shape, dtype=dest.dtype, device=dest.device)
+                    else:
+                        scratch = dest.dequantize().contiguous()
+                    entry = (dest, scratch, amax_snapshot)
+                    self._stream_dequant_buffers[key] = entry
+
+                _, scratch, _ = entry
+                # Narrow the high-precision scratch exactly as DCP would have
+                # narrowed the destination, so offsets and lengths still line up.
+                return narrow_tensor_by_index(scratch, read_item.dest_offsets, read_item.lengths)
+
+        target_tensor = super().resolve_tensor(read_item)
 
         if (
             not target_tensor.is_contiguous()
@@ -640,19 +722,35 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
     def commit_tensor(self, read_item: ReadItem, tensor: torch.Tensor) -> None:
         """Undo the detours stashed in ``resolve_tensor``.
 
-        - Streaming case: copy the high-precision scratch back into the
-          original quantized tensor (quantize-on-copy), then restore the
-          pre-load ``amax`` for delayed-scaling quantizers.
+        - Streaming case: decrement this destination's outstanding read-item count
+          and, once it reaches zero, quantize-copy the whole scratch back into the
+          destination in one shot, then restore the pre-load ``amax`` for
+          delayed-scaling quantizers. Committing only on the last read item is what
+          makes the quantization granularity match the legacy path exactly.
         - Non-contiguous case: copy the contiguous clone back into the
           original narrowed Float8Tensor view.
         """
-        entry = self._intermediate_read_items.pop(id(read_item), None)
+        key = read_item.dest_index
+        entry = self._stream_dequant_buffers.get(key)
         if entry is not None:
-            _, target_tensor, amax_snapshot, kind = entry
+            dest, scratch, amax_snapshot = entry
+            remaining = self._stream_dequant_pending.get(key, 1) - 1
+            self._stream_dequant_pending[key] = remaining
+            if remaining <= 0:
+                dest.copy_(scratch)
+                if amax_snapshot is not None:
+                    # quantizer was non-None when we took the snapshot
+                    dest._quantizer.amax.copy_(amax_snapshot)
+                # Drop the scratch as soon as it is consumed; holding it is what
+                # the streaming design exists to avoid.
+                del self._stream_dequant_buffers[key]
+            tensor = dest
+            return super().commit_tensor(read_item, tensor)
+
+        interm = self._intermediate_read_items.pop(id(read_item), None)
+        if interm is not None:
+            _, target_tensor, _, _ = interm
             target_tensor.copy_(tensor)
-            if kind == "stream" and amax_snapshot is not None:
-                # quantizer was non-None when we took the snapshot
-                target_tensor._quantizer.amax.copy_(amax_snapshot)
             tensor = target_tensor
         return super().commit_tensor(read_item, tensor)
 
