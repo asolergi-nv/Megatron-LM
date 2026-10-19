@@ -7,6 +7,7 @@ import enum
 import importlib
 import inspect
 import itertools
+import textwrap
 import types
 import typing
 import warnings
@@ -259,14 +260,28 @@ class ArgumentGroupFactory:
         return arg_group
 
     def _get_field_docstrings(self, src_cfg_class: type) -> dict[str, str]:
-        """Extract field-level docstrings from a dataclass by inspecting its AST.
+        """Extract field-level docstrings from a dataclass and its bases.
 
-        Recurses on parent classes of `src_cfg_class`.
+        Walks the method resolution order of `src_cfg_class`: a docstring on the class itself wins
+        over its bases, and an earlier class in the MRO wins over a later one, so a field
+        redeclared along a diamond is documented by the class Python resolves it to.
 
         Args:
             src_cfg_class: Dataclass to get docstrings from.
         """
-        source = inspect.getsource(src_cfg_class)
+        field_docstrings: dict[str, str] = {}
+        for klass in src_cfg_class.__mro__:
+            if klass.__name__ in builtins.__dict__:
+                continue
+            for name, docstring in self._get_own_field_docstrings(klass).items():
+                field_docstrings.setdefault(name, docstring)
+        return field_docstrings
+
+    @staticmethod
+    def _get_own_field_docstrings(src_cfg_class: type) -> dict[str, str]:
+        """Field-level docstrings written in the body of `src_cfg_class` itself, from its AST."""
+        # Dedent so that classes defined inside functions (tests, factories) can be parsed too.
+        source = textwrap.dedent(inspect.getsource(src_cfg_class))
         tree = ast.parse(source)
         root_node = tree.body[0]
 
@@ -292,14 +307,78 @@ class ArgumentGroupFactory:
 
                 field_docstrings[a.target.id] = docstring
 
-        # recurse on parent class
-        base_classes = src_cfg_class.__bases__
-        if len(base_classes) > 0:
-            parent_class = base_classes[0]
-            if parent_class.__name__ not in builtins.__dict__:
-                field_docstrings.update(self._get_field_docstrings(base_classes[0]))
-
         return field_docstrings
+
+
+def _is_multi_type_union(config_type: Any) -> bool:
+    """Whether ``config_type`` is a union of more than one non-None type (not an Optional)."""
+    if typing.get_origin(config_type) not in (types.UnionType, typing.Union):
+        return False
+    return len([t for t in typing.get_args(config_type) if t is not type(None)]) > 1
+
+
+class DatasetArgumentGroupFactory(ArgumentGroupFactory):
+    """ArgumentGroupFactory for the dataset section: legacy spellings, dests and alias flags.
+
+    Args:
+        src_cfg_class: the dataset dataclass (``GPTDatasetConfig``).
+        legacy: field name -> ``add_argument`` keyword overrides applied last, after type inference
+            and field metadata (``LEGACY_ARG_MAP``): legacy flag spellings, ``dest`` values, the
+            absence of a ``type`` converter, and a parser default that differs from the field's.
+        aliases: legacy flag -> ``(dest, dataset_type value)`` (``LEGACY_ALIAS_FLAGS``), added as
+            plain ``store_true`` flags after the generated arguments.
+        alias_help: legacy flag -> help text for the alias flags.
+        exclude, prefix: as for ``ArgumentGroupFactory``.
+
+    A field whose type is a union of several non-None types (``str | list[str] | None``) is
+    described by its ``argparse_meta`` metadata and the legacy overrides alone, without the base
+    class's inference warning.
+    """
+
+    def __init__(
+        self,
+        src_cfg_class: type,
+        *,
+        legacy: Optional[dict[str, dict[str, Any]]] = None,
+        aliases: Optional[dict[str, tuple[str, str]]] = None,
+        alias_help: Optional[dict[str, str]] = None,
+        exclude: Optional[list[str]] = None,
+        prefix: Optional[str] = None,
+    ) -> None:
+        super().__init__(src_cfg_class, exclude=exclude, prefix=prefix)
+        self.legacy = dict(legacy or {})
+        self.aliases = dict(aliases or {})
+        self.alias_help = dict(alias_help or {})
+
+    def _build_argparse_kwargs_from_field(self, attribute: Field) -> dict[str, Any]:
+        if _is_multi_type_union(attribute.type):
+            name = attribute.name if self.prefix is None else f"{self.prefix}_{attribute.name}"
+            argparse_kwargs: dict[str, Any] = {
+                "arg_names": [self._format_arg_name(name)],
+                "dest": name,
+                "help": self.field_docstrings.get(attribute.name, ""),
+                "default": (
+                    attribute.default_factory()
+                    if isinstance(attribute.default, type(dataclasses.MISSING))
+                    else attribute.default
+                ),
+            }
+            argparse_kwargs.update(attribute.metadata.get("argparse_meta", {}))
+        else:
+            argparse_kwargs = super()._build_argparse_kwargs_from_field(attribute)
+        argparse_kwargs.update(self.legacy.get(attribute.name, {}))
+        return argparse_kwargs
+
+    def build_group(self, parser: ArgumentParser, title: Optional[str] = None) -> _ArgumentGroup:
+        group = super().build_group(parser, title=title)
+        for flag, (dest, family) in self.aliases.items():
+            group.add_argument(
+                flag,
+                dest=dest,
+                action="store_true",
+                help=self.alias_help.get(flag, f"Alias of --dataset-type {family}."),
+            )
+        return group
 
 
 def _mfsdp_v2_disables_pipeline_output_dealloc(args) -> bool:

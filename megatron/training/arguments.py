@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron arguments."""
 
@@ -35,10 +35,12 @@ from megatron.core.utils import (
 from megatron.training import global_vars
 from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=unused-import
     ArgumentGroupFactory,
+    DatasetArgumentGroupFactory,
     _default_config_from_args,
     _wide_residual_config_from_args,
     core_transformer_config_from_args,
 )
+from megatron.training.config.dataset_config import project_dataset_type_into_args
 from megatron.training.utils import (
     get_device_arch_version,
     print_rank_0,
@@ -84,7 +86,6 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
-    parser = _add_varlen_dataset_args(parser)
 
     parser = _add_fault_injector_args(parser)
 
@@ -604,6 +605,14 @@ def validate_args(args, defaults={}):
                                                  v2=getattr(args, key)))
         else:
             setattr(args, key, defaults[key])
+
+    # Resolve --dataset-type and its legacy alias flags (--sft, --use-varlen-dataset, --fim-data)
+    # once, before any check reads them, so both spellings are validated and consumed alike.
+    project_dataset_type_into_args(args)
+
+    if getattr(args, 'sample_rate', 1.0) != 1.0:
+        warn_rank_0('--sample-rate is deprecated and has no effect; it will be removed in a '
+                    'future release.')
 
     if args.data_path is not None and args.split is None:
         legacy_default_split_value = '969, 30, 1'
@@ -2905,9 +2914,6 @@ def _add_training_args(parser):
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
                        help='Disable pinning of CPU memory for parameters.')
-    group.add_argument('--dataloader-type', type=str, default=None,
-                       choices=['single', 'cyclic', 'external'],
-                       help='Single pass vs multiple pass data loader')
     group.add_argument('--no-persist-layer-norm', action='store_true',
                        help='Disable using persistent fused layer norm kernel. '
                        'This kernel supports only a set of hidden sizes. Please '
@@ -3248,129 +3254,38 @@ def _add_tokenizer_args(parser):
 
 
 def _add_data_args(parser):
-    group = parser.add_argument_group(title='data and dataloader')
+    from megatron.training.config import GPTDatasetConfig
+    from megatron.training.config.dataset_config import (
+        DATASET_CLI_EXCLUDE,
+        LEGACY_ALIAS_FLAGS,
+        LEGACY_ALIAS_HELP,
+        LEGACY_ARG_MAP,
+    )
 
-    group.add_argument('--data-path', nargs='*', default=None,
-                       help='The weight and prefix list for a set of train, validation, and test'
-                       'datasets which split according to --split. The accepted formats are: '
-                       '(1) a single prefix, '
-                       '(2) a list of weight prefix pairs e.g. weight1 prefix1 weight2 prefix2, '
-                       '(3) a list of prefixes e.g. prefix1 prefix2. '
-                       'For (3), weights are inferred from the lengths of the contributing datasets. '
-                       'This argument is exclusive to the other independent --*-data-path arguments.')
-    group.add_argument('--phase-transition-iterations', type=str, default=None,
-                       help='Comma-separated list of iterations where phase '
-                       'transitions occur. Requires fixed global batch size across phases.')
-    group.add_argument('--split', type=str, default=None,
-                       help='Comma-separated list of proportions for training,'
-                       ' validation, and test split. For example the split '
-                       '`90,5,5` will use 90%% of data for training, 5%% for '
-                       'validation and 5%% for test.')
-    group.add_argument('--train-data-path', nargs='*', default=None,
-                       help='The weight and prefix list for an independent train dataset. '
-                       'Follows the same pattern rules as --data-path.')
-    group.add_argument('--valid-data-path', nargs='*', default=None,
-                       help='The weight and prefix list for an independent validation dataset. '
-                       'Follows the same pattern rules as --data-path.')
-    group.add_argument('--test-data-path', nargs='*', default=None,
-                       help='The weight and prefix list for an independent test dataset. '
-                       'Follows the same pattern rules as --data-path.')
-    group.add_argument('--data-args-path', type=str, default=None,
-                       help='Path to data-args. Instead of feeding `--data-path` '
-                       'with weighted dataset, we pass in a file path from which '
-                       'we read that argument. This is useful when the list of data is '
-                       'too big.')
-    group.add_argument('--per-split-data-args-path', type=str, default=None,
-                       help='Path to per-split-data-args. Instead of feeding '
-                       '`--(train|valid|test)-data-path` with weighted dataset, '
-                       'we pass in a file path from which we read those arguments. '
-                       'This is useful when the list of data is too big. Format is a '
-                       'json file with `train`, `valid, `test` keys')
-    group.add_argument('--per-dataset-sequences-path', default=None,
-                       help='Path to a json file with the sequences per dataset. Check the tools/build_sequences_per_dataset.py script to build this file.')
-    group.add_argument('--dataloader-fast-cache-load', action='store_true',
-                       help='Option to use the fast cache loading path when building the datasets. Requires all the dataset caches to be built and stored in --data-cache-path.')
-    group.add_argument('--dataloader-defer-npy-index-mmap', action='store_true',
-                       help='Defer the mmap of the dataset indexes (.npy files) until the first access. Requires all the dataset caches to be built and stored in --data-cache-path.')
-    group.add_argument('--data-cache-path', default=None,
-                       help='Path to a directory to hold cached index files.')
-    group.add_argument('--no-mmap-bin-files', action='store_false',
-                       help='Disable mmap-ing of .bin files.',
-                       dest='mmap_bin_files')
-    group.add_argument('--mock-data', action='store_true',
-                       help='Skip data loading and validation and opt for artificial '
-                       'generation of mock data when an implementation is available.')
-    group.add_argument('--seq-length', type=int, default=None,
-                       help='Maximum sequence length to process.')
+    # The flags, dests and defaults are those of the GPTDatasetConfig fields; LEGACY_ARG_MAP keeps
+    # the historical spellings and LEGACY_ALIAS_FLAGS the family flags (--sft, --use-varlen-dataset,
+    # --fim-data) as aliases of --dataset-type.
+    data_factory = DatasetArgumentGroupFactory(
+        GPTDatasetConfig,
+        legacy=LEGACY_ARG_MAP,
+        aliases=LEGACY_ALIAS_FLAGS,
+        alias_help=LEGACY_ALIAS_HELP,
+        exclude=DATASET_CLI_EXCLUDE,
+    )
+    group = data_factory.build_group(parser, 'data and dataloader')
+
+    # Legacy data arguments without a field in GPTDatasetConfig.
     group.add_argument('--encoder-seq-length', type=int, default=None,
                        help='Maximum encoder sequence length to process.'
                        'This should be exclusive of --seq-length')
     group.add_argument('--decoder-seq-length', type=int, default=None,
                        help="Maximum decoder sequence length to process.")
     group.add_argument('--sample-rate', type=float, default=1.0,
-                       help='sample rate for training data. Supposed to be 0 '
-                            ' < sample_rate < 1')
+                       help='Deprecated and ignored; it will be removed in a future release.')
     group.add_argument('--mask-prob', type=float, default=0.15,
                        help='Probability of replacing a token with mask.')
     group.add_argument('--short-seq-prob', type=float, default=0.1,
                        help='Probability of producing a short sequence.')
-    group.add_argument('--num-workers', type=int, default=2,
-                       help="Dataloader number of workers.")
-    group.add_argument('--reset-position-ids', action='store_true',
-                       help='Reset posistion ids after end-of-document token.')
-    group.add_argument('--reset-attention-mask', action='store_true',
-                       help='Reset self attention mask after '
-                       'end-of-document token.')
-    group.add_argument('--dataloader-inter-document-masking', action='store_true',
-                       help='Return cu_seqlens marking document boundaries '
-                       'within each sample so that attention is restricted '
-                       'to individual documents.')
-    group.add_argument('--eod-mask-loss', action='store_true',
-                       help='Mask loss for the end of document tokens.')
-    group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
-                       help='If set, do not create attention_masks in dataloader.',
-                       dest='create_attention_mask_in_dataloader')
-    group.add_argument('--num-dataset-builder-threads', type=int, default=1,
-                       help='Number of parallel threads per rank for dataset builder')
-    group.add_argument('--object-storage-cache-path', type=str, default=None,
-                       help='Path to cache index files when using s3 or msc dataloader')
-    group.add_argument('--mid-level-dataset-surplus', type=float, default=0.005,
-                       help='The sample surplus to build for the mid-level datasets(s)')
-    group.add_argument('--allow-ambiguous-pad-tokens', action='store_true',
-                       help='Whether to prevent pad tokens already present in the dataset '
-                       'from being masked out when the pad token incorrectly shares the same id '
-                       'with other special tokens in the tokenizer. Note that this argument has '
-                       'no effect when the tokenizer correctly provides a unique id for the pad. '
-                       'Masking out such ambiguous pad tokens results in training instability. '
-                       'Such a scenario is best resolved by fixing the tokenizer; leaving this '
-                       'option as False provides a workaround. '
-                       'When left to the default of False, any token ids that collide with the '
-                       'pad token id - as provided by the tokenizer - will not be masked out of '
-                       'the loss calculation: it cannot be determined whether they are truly pad. '
-                       'If instead this argument is set, the training flow will treat all tokens '
-                       'that share the same id as the pad token as true pad tokens, potentially '
-                       'causing severe training instability.')
-    group.add_argument('--fim-data', action='store_true', help='Whether to use the FIM dataset.')
-    group.add_argument('--fim-rate', type=float, default=0.5,
-                       help='Probability to convert a training sample into a FIM format.')
-    group.add_argument('--fim-spm-rate', type=float, default=0.5,
-                       help='Probability that the a FIM sample uses the SPM format over the PSM format.')
-    group.add_argument('--fim-split-sample', type=str, default=None,
-                       help='String around which to split the sample for FIM.')
-    group.add_argument('--fim-fragment-rate', type=float, default=None,
-                       help='Rate of FIM on each fragment when --fim-split-sample is not None.')
-    group.add_argument('--fim-no-prefix', type=str, default=None,
-                       help='Do not apply FIM to fragments that start with this prefix')
-    group.add_argument('--fim-prefix-token', type=str, default='<fim_prefix>',
-                       help='FIM prefix token')
-    group.add_argument('--fim-middle-token', type=str, default='<fim_middle>',
-                       help='FIM middle token')
-    group.add_argument('--fim-suffix-token', type=str, default='<fim_suffix>',
-                       help='FIM suffix token')
-    group.add_argument('--fim-pad-token', type=str, default='<fim_pad>',
-                       help='FIM PAD token')
-    group.add_argument('--fim-eod-token', type=str, default='<|endoftext|>',
-                       help='FIM EOD token')
     return parser
 
 
@@ -3404,9 +3319,6 @@ def _add_vision_args(parser):
                        help='training with fraction of classes.')
     group.add_argument('--data-per-class-fraction', type=float, default=1.0,
                        help='training with fraction of data per class.')
-    group.add_argument('--no-data-sharding', action='store_false',
-                       help='Disable data sharding.',
-                       dest='data_sharding')
     group.add_argument('--head-lr-mult', type=float, default=1.0,
                        help='learning rate multiplier for head during finetuning')
 
@@ -3735,7 +3647,6 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
 
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
-    group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
     group.add_argument(
@@ -3748,53 +3659,9 @@ def _add_sft_args(parser):
             'microbatch losses.'
         ),
     )
-    group.add_argument('--sft-mock-dataset-config-json', type=str, default=None,
-                       help='This config provides the necessary information for the mock '
-                       'dataset. Accepts either an inline JSON literal or a path to a JSON '
-                       'file containing the same schema. You can either specify a CSV file '
-                       'that contains sequence lengths, where each line stores the length of '
-                       'a sequence, for example: {"mode":"file","path":"/path/to/file"}. '
-                       'Alternatively, you can specify a distribution (currently only '
-                       'supporting lognormal distribution) along with the required '
-                       'parameters, for example, {"mode":"distribution","type":"lognormal",'
-                       '"min_seq_len":1024,"max_seq_len":2048,"mean_seq_len":1536,'
-                       '"lognormal_sigma":1.1}, where sigma controls the variability of the '
-                       'lognormal distribution. If not specified and --mock-data is set, '
-                       'defaults to a lognormal distribution with min_seq_len=seq_length//2, '
-                       'max_seq_len=seq_length, mean_seq_len=seq_length*3//4, '
-                       'lognormal_sigma=1.1.')
     return parser
 
 
-def _add_varlen_dataset_args(parser):
-    group = parser.add_argument_group(title='varlen dataset')
-    group.add_argument('--use-varlen-dataset', action="store_true",
-                       help='Train with VarlenDataset, a variable-length packed (THD) dataset '
-                       'that consumes instruction-tuning data from a HuggingFace Hub repo id, '
-                       'a local parquet file, or a local jsonl file. Schema (alpaca / sharegpt '
-                       '/ openai-messages) is auto-detected from the dataset columns. '
-                       'Mutually exclusive with --sft. Auto-picks a sequence packing '
-                       'scheduler when none is given: dp_balanced. '
-                       'Combine with --mock-data for a synthetic lognormal sequence-length '
-                       'distribution; see --varlen-mock-dataset-config-json.')
-    group.add_argument('--varlen-sbhd-validation', action="store_true",
-                       help='Reference SBHD mode for THD numerical verification. When set, '
-                       'VarlenDataset emits SBHD-style samples right-padded to '
-                       '--seq-length (no cu_seqlens, no packing scheduler), so the run can '
-                       'be compared against the THD path to validate correctness. '
-                       'Incompatible with --sequence-packing-scheduler.')
-    group.add_argument('--varlen-mock-dataset-config-json', type=str, default=None,
-                       help='Mock-dataset config for --use-varlen-dataset --mock-data. '
-                       'Accepts either an inline JSON literal or a path to a JSON file '
-                       'containing the same schema as --sft-mock-dataset-config-json: either '
-                       '{"mode":"file","path":"/path/to/lengths.csv"}, '
-                       '{"mode":"distribution","type":"lognormal","min_seq_len":1024,'
-                       '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, or '
-                       '{"mode":"verification","data_path":"/prefix/of/IndexedDataset"}. '
-                       'If not specified, defaults to a lognormal distribution with '
-                       'min_seq_len=seq_length//2, max_seq_len=seq_length, '
-                       'mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.')
-    return parser
 
 def _add_logits_distillation_args(parser):
     group = parser.add_argument_group(title='Logits Distillation')
