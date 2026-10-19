@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 import sys
@@ -72,6 +72,7 @@ def run_config(monkeypatch):
     from megatron.training import global_vars
     from megatron.training.config import (
         CheckpointConfig,
+        GPTDatasetConfig,
         LoggerConfig,
         PretrainConfigContainer,
         SchedulerConfig,
@@ -84,6 +85,7 @@ def run_config(monkeypatch):
         model=None,
         optimizer=OptimizerConfig(),
         scheduler=SchedulerConfig(),
+        dataset=GPTDatasetConfig(mock_data=True, seq_length=16),
         logger=LoggerConfig(),
         checkpoint=CheckpointConfig(),
     )

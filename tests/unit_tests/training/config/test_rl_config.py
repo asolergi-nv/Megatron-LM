@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tests for the RL config section and the argument group generated from it."""
 
 import argparse
@@ -212,6 +212,7 @@ def test_validate_run_at_every_call_site():
     from megatron.core.optimizer import OptimizerConfig
     from megatron.training.config import (
         CheckpointConfig,
+        GPTDatasetConfig,
         LoggerConfig,
         PretrainConfigContainer,
         SchedulerConfig,
@@ -248,6 +249,7 @@ def test_validate_run_at_every_call_site():
             model=model,
             optimizer=OptimizerConfig(),
             scheduler=SchedulerConfig(),
+            dataset=GPTDatasetConfig(mock_data=True, seq_length=16),
             logger=LoggerConfig(),
             checkpoint=CheckpointConfig(),
             rl=rl if rl is not None else RLConfig(perform_rl_step=True, **GRPO_4x3, **rl_kwargs),

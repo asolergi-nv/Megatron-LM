@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import ast
 import builtins
@@ -23,7 +23,9 @@ from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.tuning import AutotunePolicy
 from megatron.training.config import (
     CheckpointConfig,
+    DataloaderConfig,
     DistributedInitConfig,
+    GPTDatasetConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
     LoggerConfig,
@@ -37,6 +39,11 @@ from megatron.training.config import (
     TokenizerConfig,
     TrainingConfig,
     ValidationConfig,
+)
+from megatron.training.config.dataset_config import (
+    DATASET_CLI_EXCLUDE,
+    LEGACY_ARG_MAP,
+    dataset_type_from_args,
 )
 from megatron.training.models import GPTModelConfig, HybridModelConfig
 
@@ -771,9 +778,42 @@ def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
     return ProfilingConfig(**deepcopy(kwargs))
 
 
-def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
-    """Build a PretrainConfigContainer from the argparse arguments."""
+def gpt_dataset_config_from_args(args: Namespace) -> GPTDatasetConfig:
+    """Build the declarative GPT dataset config from legacy arguments: no tokenizer, no I/O.
+
+    Field values come from the ``args`` attribute of the same name, or the legacy ``dest`` in
+    ``LEGACY_ARG_MAP``; attributes missing from ``args`` keep the dataclass defaults. The dataset
+    family comes from ``--dataset-type`` and its alias flags, resolved as ``validate_args`` did.
+    """
+    renames = {name: spec["dest"] for name, spec in LEGACY_ARG_MAP.items() if "dest" in spec}
+    kwargs = {"dataset_type": dataset_type_from_args(args, warn=False)}
+    for f in fields(GPTDatasetConfig):
+        if not f.init or f.name in DATASET_CLI_EXCLUDE or f.name == "dataset_type":
+            continue
+        src = renames.get(f.name, f.name)
+        if hasattr(args, src):
+            kwargs[f.name] = deepcopy(getattr(args, src))
+    return GPTDatasetConfig(**kwargs)
+
+
+def dataloader_config_from_args(args: Namespace) -> DataloaderConfig:
+    """Loader-only settings for entry points whose datasets are built by callbacks."""
+    return deepcopy(_default_config_from_args(DataloaderConfig, args))
+
+
+def pretrain_cfg_container_from_args(
+    args: Namespace, model_cfg=None, *, dataset_cfg: GPTDatasetConfig | DataloaderConfig | None = None
+) -> PretrainConfigContainer:
+    """Build a PretrainConfigContainer from the argparse arguments.
+
+    ``dataset_cfg`` defaults to the GPT dataset declaration built from ``args``, so every entry
+    point carries a complete, serializable dataset section; entry points with their own data
+    pipeline may pass a ``DataloaderConfig`` or their own declaration instead.
+    """
     from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
+
+    if dataset_cfg is None:
+        dataset_cfg = gpt_dataset_config_from_args(args)
 
     if model_cfg is None:
         msg = """
@@ -802,6 +842,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         model=model_cfg,
         optimizer=optim_cfg,
         scheduler=_default_config_from_args(SchedulerConfig, args),
+        dataset=dataset_cfg,
         ddp=ddp_config,
         dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),

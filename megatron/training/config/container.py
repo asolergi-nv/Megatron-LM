@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import os
 from dataclasses import dataclass, field
@@ -17,6 +17,11 @@ from megatron.core.distributed.distributed_data_parallel_config import Distribut
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.optimizer import OptimizerConfig
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
+from megatron.training.config.dataset_config import (
+    DataloaderConfig,
+    DatasetRuntimeContext,
+    GPTDatasetConfig,
+)
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.resilience_config import (
@@ -34,7 +39,7 @@ from megatron.training.config.training_config import (
 )
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import GPTModelConfig, Serializable, HybridModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig, Serializable
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -78,10 +83,17 @@ class ConfigContainerBase:
             rng.finalize_model_config(getattr(self, "model", None))
     
     @classmethod
+    def _upgrade_config_dict(cls, config_dict: dict[str, Any], legacy_args: Any) -> dict[str, Any]:
+        """Hook for containers that complete configurations saved by older versions."""
+        return config_dict
+
+    @classmethod
     def from_dict(
         cls: Type[T],
         config_dict: dict[str, Any],
         mode: InstantiationMode = InstantiationMode.STRICT,
+        *,
+        legacy_args: Any = None,
     ) -> T:
         """
         Create a config container from a dictionary.
@@ -89,6 +101,8 @@ class ConfigContainerBase:
         Args:
             config_dict: Dictionary containing configuration
             mode: Serialization mode (strict or lenient)
+            legacy_args: Optional validated argparse namespace used to synthesize sections that
+                the dictionary predates (see ``PretrainConfigContainer``)
 
         Returns:
             A new instance of this class initialized with the dictionary values
@@ -101,6 +115,7 @@ class ConfigContainerBase:
         # Apply backward compatibility: remove init=False fields that may have been
         # serialized by older versions (these are computed in __post_init__)
         config_dict = sanitize_dataclass_config(config_dict)
+        config_dict = cls._upgrade_config_dict(config_dict, legacy_args)
 
         # Check for extra keys in strict mode
         expected_fields = {f.name for f in dataclass_fields(cls) if not f.name.startswith("_")}
@@ -121,13 +136,21 @@ class ConfigContainerBase:
         return instance
 
     @classmethod
-    def from_yaml(cls: Type[T], yaml_path: str, mode: InstantiationMode = InstantiationMode.LENIENT) -> T:
+    def from_yaml(
+        cls: Type[T],
+        yaml_path: str,
+        mode: InstantiationMode = InstantiationMode.LENIENT,
+        *,
+        legacy_args: Any = None,
+    ) -> T:
         """
         Create a config container from a YAML file.
 
         Args:
             yaml_path: Path to the YAML file
             mode: Serialization mode (strict or lenient)
+            legacy_args: Optional validated argparse namespace used to synthesize sections that
+                the file predates (see ``PretrainConfigContainer``)
 
         Returns:
             A new instance of this class initialized with the YAML file values
@@ -151,7 +174,10 @@ class ConfigContainerBase:
         # Convert to OmegaConf first for better compatibility with instantiate
         conf = OmegaConf.create(config_dict)
 
-        return cls.from_dict(OmegaConf.to_container(conf, resolve=True), mode=mode)
+        config_dict = OmegaConf.to_container(conf, resolve=True)
+        if legacy_args is None:
+            return cls.from_dict(config_dict, mode=mode)
+        return cls.from_dict(config_dict, mode=mode, legacy_args=legacy_args)
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -278,7 +304,10 @@ class PretrainConfigContainer(ConfigContainerBase):
     model: HybridModelConfig | GPTModelConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
-    # dataset: GPTDatasetConfig # TODO (@maanug): add support
+    dataset: GPTDatasetConfig | DataloaderConfig
+    """Declarative dataset and dataloader settings. GPT entry points build their datasets from it
+    through ``GPTDatasetConfig.to_core_config()``; entry points with their own data pipeline carry
+    at least the loader settings."""
     ddp: DistributedDataParallelConfig = field(default_factory=DistributedDataParallelConfig)
     dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
     rng: RNGConfig = field(default_factory=RNGConfig)
@@ -307,10 +336,58 @@ class PretrainConfigContainer(ConfigContainerBase):
             exit_interval=self.train.exit_interval,
         )
 
+    def dataset_runtime_context(
+        self, tokenizer: Any, *, data_parallel_size: int | None = None, **overrides: Any
+    ) -> DatasetRuntimeContext:
+        """Runtime inputs for ``GPTDatasetConfig.to_core_config()``, taken from the other sections.
+
+        The seed comes from ``rng``, the parallel sizes from ``model.transformer`` when the model
+        config carries one, and the validation flags from ``validation``. ``data_parallel_size`` is
+        a runtime value the caller supplies; ``overrides`` replace any derived value.
+        """
+        transformer = getattr(self.model, "transformer", None)
+        tensor_parallel = getattr(transformer, "tensor_model_parallel_size", None)
+        sequence_parallel = getattr(transformer, "sequence_parallel", None)
+        values: dict[str, Any] = dict(
+            tokenizer=tokenizer,
+            random_seed=self.rng.seed,
+            data_parallel_size=data_parallel_size,
+            context_parallel_size=getattr(transformer, "context_parallel_size", None),
+            sequence_parallel_size=(
+                None
+                if tensor_parallel is None or sequence_parallel is None
+                else tensor_parallel * int(bool(sequence_parallel))
+            ),
+            hybrid_context_parallel=getattr(transformer, "hybrid_context_parallel", None),
+            full_validation=getattr(self.validation, "full_validation", None),
+            multiple_validation_sets=getattr(self.validation, "multiple_validation_sets", None),
+        )
+        values.update(overrides)
+        return DatasetRuntimeContext(**values)
+
     def _finalize(self) -> None:
         super()._finalize()
+        finalize_dataset = getattr(self.dataset, "finalize", None)
+        if callable(finalize_dataset):
+            finalize_dataset()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
+
+    @classmethod
+    def _upgrade_config_dict(cls, config_dict: dict[str, Any], legacy_args: Any) -> dict[str, Any]:
+        """Add the ``dataset`` section to a run configuration saved before the section existed."""
+        if "dataset" in config_dict:
+            return config_dict
+        if legacy_args is None:
+            raise ValueError(
+                f"{cls.__qualname__} configuration has no 'dataset' section (it was saved before "
+                "the section existed). Pass legacy_args=<validated argparse Namespace> to "
+                "synthesize it from the legacy data arguments, or add a dataset section."
+            )
+        from megatron.training.argument_utils import gpt_dataset_config_from_args
+
+        config_dict["dataset"] = gpt_dataset_config_from_args(legacy_args).to_cfg_dict()
+        return config_dict
 
 
 @dataclass(kw_only=True)
