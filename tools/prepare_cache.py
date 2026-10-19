@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Prepare GPT dataset caches ahead of training.
 
@@ -7,18 +7,19 @@ Unsupported configurations:
 """
 
 import argparse
-import json
-from typing import Any, Dict, List, Optional, Tuple
+import dataclasses
+from typing import Any, Dict, Optional
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.datasets.utils import compile_helpers
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training import get_train_valid_test_num_samples
+from megatron.training.argument_utils import gpt_dataset_config_from_args
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.config import DatasetRuntimeContext
 from megatron.training.global_vars import set_args, unset_global_variables
 from megatron.training.training import update_train_iters
-from megatron.training.utils import get_blend_and_blend_per_split
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
@@ -117,47 +118,34 @@ def _print_effective_configuration(
         print("> ignoring --dataloader-defer-npy-index-mmap during cache preparation")
 
 
+# Constructor keywords the cache-preparation factory never forwarded: Megatron Core's defaults
+# apply.
+_OMITTED_CORE_FIELDS = frozenset(
+    {
+        "inter_document_masking",
+        "sft_mock_dataset_config_json",
+        "varlen_mock_dataset_config_json",
+        "varlen_sbhd_validation",
+    }
+)
+
+
+def _effective_dataset_config(dataset_config):
+    """Cache preparation builds the plain GPT dataset whatever family was requested, as before."""
+    if dataset_config.dataset_type != "gpt":
+        return dataclasses.replace(dataset_config, dataset_type="gpt")
+    return dataset_config
+
+
 def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
-    """Build the explicit GPTDatasetConfig used for offline cache preparation."""
+    """Build the explicit GPTDatasetConfig used for offline cache preparation.
 
-    tokenizer = build_tokenizer(args)
-
-    blend: Optional[Tuple[List[str], Optional[List[float]]]]
-    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
-    blend, blend_per_split = get_blend_and_blend_per_split(args)
-
-    sequences_per_dataset = None
-    if args.per_dataset_sequences_path is not None:
-        with open(args.per_dataset_sequences_path, "r") as f:
-            sequences_per_dataset = json.load(f)
-
-    return GPTDatasetConfig(
-        random_seed=args.seed,
-        sequence_length=args.seq_length,
-        blend=blend,
-        blend_per_split=blend_per_split,
-        split=args.split,
-        multiple_validation_sets=args.multiple_validation_sets,
-        full_validation=args.full_validation,
-        num_dataset_builder_threads=args.num_dataset_builder_threads,
-        path_to_cache=args.data_cache_path,
-        mmap_bin_files=args.mmap_bin_files,
-        tokenizer=tokenizer,
-        reset_position_ids=args.reset_position_ids,
-        reset_attention_mask=args.reset_attention_mask,
-        eod_mask_loss=args.eod_mask_loss,
-        create_attention_mask=args.create_attention_mask_in_dataloader,
-        object_storage_cache_path=args.object_storage_cache_path,
-        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
-        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
-        fast_cache_load=args.dataloader_fast_cache_load,
-        sequences_per_dataset=sequences_per_dataset,
-        defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
-        context_parallel_size=args.context_parallel_size,
-        data_parallel_size=args.data_parallel_size,
-        sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
-        hybrid_context_parallel=args.hybrid_context_parallel,
-    )
+    The declaration comes from the legacy arguments (``gpt_dataset_config_from_args``); as
+    before, the seed is ``args.seed`` and a tokenizer is built from ``args``.
+    """
+    context = DatasetRuntimeContext.from_args(args, build_tokenizer(args))
+    effective = _effective_dataset_config(gpt_dataset_config_from_args(args))
+    return effective.to_core_config(context, exclude=_OMITTED_CORE_FIELDS)
 
 
 def build_dataset_caches(args: Any) -> Dict[str, Any]:

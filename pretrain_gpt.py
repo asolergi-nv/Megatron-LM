@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain and SFT GPT."""
 
@@ -7,7 +7,7 @@ import time
 
 _PROGRAM_START_TIME = time.time()
 
-import json
+import dataclasses
 
 from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 
@@ -17,7 +17,7 @@ from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 suppress_duplicate_logs_off_rank0()
 
 from functools import lru_cache, partial
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional
 
 import torch
 
@@ -27,8 +27,8 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.gpt import GPTModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -57,17 +57,22 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    gpt_dataset_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
+from megatron.training.config import DatasetRuntimeContext
+from megatron.training.datasets.fim_dataset import GPTFIMDataset
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
-from megatron.training.training import update_seqlen_stats_from_cu_seqlens
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
-from megatron.training.global_vars import (
-    get_run_config,
-    set_run_config,
+from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.training import (
+    build_dataset_runtime_context,
+    update_seqlen_stats_from_cu_seqlens,
 )
+from megatron.training.utils import is_first_or_last_pipeline_stage
 from model_provider import model_provider
 
 try:
@@ -415,112 +420,64 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     )
 
 
-def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
-    """Build the GPT (or FIM) dataset config from parsed CLI args."""
-    cfg = get_run_config()
-    tokenizer = build_tokenizer(args)
+# Dataset class per (declared dataset family, effective mock mode). The mock mode is the runtime
+# config's resolved ``mock``: an explicit --mock-data, or no data source declared.
+_DATASET_CLASSES = {
+    ("gpt", False): GPTDataset,
+    ("gpt", True): MockGPTDataset,
+    ("fim", False): GPTFIMDataset,
+    ("varlen", False): VarlenDataset,
+    ("varlen", True): MockVarlenDataset,
+    ("sft", False): SFTDataset,
+    ("sft", True): MockSFTDataset,
+}
 
-    # Sometimes --data-path is too long, instead we parse it from a file.
-    blend: Optional[Tuple[List[str], Optional[List[float]]]]
-    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
-    blend, blend_per_split = get_blend_and_blend_per_split(args)
 
-    sequences_per_dataset = None
-    if args.per_dataset_sequences_path is not None:
-        with open(args.per_dataset_sequences_path, "r") as f:
-            sequences_per_dataset = json.load(f)
+def _resolve_dataset_build(dataset_config, context):
+    """Dataset class, runtime dataset config and packedness for a declaration.
 
-    data_args = {
-        "random_seed": cfg.rng.seed,
-        "sequence_length": args.seq_length,
-        "blend": blend,
-        "blend_per_split": blend_per_split,
-        "split": args.split,
-        "multiple_validation_sets": args.multiple_validation_sets,
-        "full_validation": args.full_validation,
-        "num_dataset_builder_threads": args.num_dataset_builder_threads,
-        "path_to_cache": args.data_cache_path,
-        "mmap_bin_files": args.mmap_bin_files,
-        "tokenizer": tokenizer,
-        "reset_position_ids": args.reset_position_ids,
-        "reset_attention_mask": args.reset_attention_mask,
-        "eod_mask_loss": args.eod_mask_loss,
-        "create_attention_mask": args.create_attention_mask_in_dataloader,
-        "object_storage_cache_path": args.object_storage_cache_path,
-        "mid_level_dataset_surplus": args.mid_level_dataset_surplus,
-        "allow_ambiguous_pad_tokens": args.allow_ambiguous_pad_tokens,
-        "fast_cache_load": args.dataloader_fast_cache_load,
-        "sequences_per_dataset": sequences_per_dataset,
-        "defer_npy_index_mmap": args.dataloader_defer_npy_index_mmap,
-        "context_parallel_size": args.context_parallel_size,
-        "data_parallel_size": args.data_parallel_size,
-        "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
-        "hybrid_context_parallel": args.hybrid_context_parallel,
-        "inter_document_masking": args.dataloader_inter_document_masking,
-        "sft_mock_dataset_config_json": args.sft_mock_dataset_config_json,
-        "varlen_mock_dataset_config_json": args.varlen_mock_dataset_config_json,
-        "varlen_sbhd_validation": args.varlen_sbhd_validation,
-    }
-
-    # add FIM args to the config
-    if args.fim_data:
-        extra_tokens = {
-            "prefix": args.fim_prefix_token,
-            "middle": args.fim_middle_token,
-            "suffix": args.fim_suffix_token,
-            "pad": args.fim_pad_token,
-            "eod": args.fim_eod_token,
-        }
-        data_args.update(
-            {
-                "fim_rate": args.fim_rate,
-                "fim_spm_rate": args.fim_spm_rate,
-                "fim_extra_tokens": extra_tokens,
-                "fim_split_sample": args.fim_split_sample,
-                "fim_fragment_rate": args.fim_fragment_rate,
-                "fim_no_prefix": args.fim_no_prefix,
-            }
+    pretrain_gpt builds every dataset family, so the effective declaration is the requested one.
+    """
+    config = dataset_config.to_core_config(context)
+    key = (dataset_config.dataset_type, config.mock)
+    if key not in _DATASET_CLASSES:
+        raise ValueError(
+            f"dataset_type={dataset_config.dataset_type!r} has no mock dataset; declare a data source."
         )
-        return GPTFIMDatasetConfig(**data_args)
-
-    return GPTDatasetConfig(**data_args)
+    return _DATASET_CLASSES[key], config, dataset_config.is_packed_sequence
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
-    """Build the train test and validation datasets.
+def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
+    """Build the GPT (or FIM) runtime dataset config from parsed CLI args.
+
+    Kept for callers of the legacy shape; the provider builds from ``cfg.dataset`` instead. As
+    before, the seed is the run config's and a tokenizer is built from ``args``.
+    """
+    context = dataclasses.replace(
+        DatasetRuntimeContext.from_args(args, build_tokenizer(args)),
+        random_seed=get_run_config().rng.seed,
+    )
+    return gpt_dataset_config_from_args(args).to_core_config(context)
+
+
+def train_valid_test_datasets_provider(
+    train_val_test_num_samples, vp_stage=None, *, dataset_config=None, context=None
+):
+    """Build the train, validation and test datasets.
 
     Args:
-        train_val_test_num_samples : A list containing the number of samples in train test and validation.
+        train_val_test_num_samples: the number of samples for the train, validation and test
+            splits.
+        vp_stage: the virtual pipeline stage the datasets are built for.
+        dataset_config: the declarative ``cfg.dataset``; ``build_train_valid_test_datasets``
+            passes it, and it is read from the run config when omitted.
+        context: the ``DatasetRuntimeContext`` (tokenizer, seed, parallel sizes); likewise.
     """
-    args = get_args()
-
-    config = core_gpt_dataset_config_from_args(args)
-
-    is_packed_sequence = False
-    if args.sft:
-        if args.mock_data:
-            dataset_type = MockSFTDataset
-        else:
-            dataset_type = SFTDataset
-        is_packed_sequence = True  # SFT always uses packed sequence
-    elif args.use_varlen_dataset:
-        # Variable-length packed (THD) dataset, independent of --sft.
-        # Reuses SFTDataset's THD packing internally but is gated
-        # by its own top-level flag.
-        if args.mock_data:
-            dataset_type = MockVarlenDataset
-        else:
-            dataset_type = VarlenDataset
-        # SBHD validation mode runs the non-packed pipeline; THD mode
-        # is the packed-sequence path.
-        is_packed_sequence = not args.varlen_sbhd_validation
-    else:
-        if args.mock_data:
-            dataset_type = MockGPTDataset
-        elif args.fim_data:
-            dataset_type = GPTFIMDataset
-        else:
-            dataset_type = GPTDataset
+    if dataset_config is None:
+        dataset_config = get_run_config().dataset
+    if context is None:
+        context = build_dataset_runtime_context()
+    dataset_type, config, is_packed_sequence = _resolve_dataset_build(dataset_config, context)
 
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
