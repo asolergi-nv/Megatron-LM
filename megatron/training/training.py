@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain utilities."""
 
@@ -23,7 +23,7 @@ from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 # Third-party.
 import torch
@@ -156,7 +156,7 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     save_grads,
 )
-from megatron.training.config import FaultInjectorConfig
+from megatron.training.config import DatasetRuntimeContext, FaultInjectorConfig
 from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
@@ -195,8 +195,10 @@ from .global_vars import (
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
+    get_tokenizer,
     get_train_state,
     get_wandb_writer,
+    is_run_config_initialized,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -2065,14 +2067,16 @@ def pretrain(
                 if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
                     vp_stage_train_valid_test_dataset_provider.is_distributed = True
                 iterators = build_train_valid_test_data_iterators(
-                    vp_stage_train_valid_test_dataset_provider
+                    vp_stage_train_valid_test_dataset_provider, cfg_container=cfg_container
                 )
                 train_data_iterator.append(iterators[0])
                 valid_data_iterator.append(iterators[1])
                 test_data_iterator.append(iterators[2])
         else:
             train_data_iterator, valid_data_iterator, test_data_iterator = (
-                build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+                build_train_valid_test_data_iterators(
+                    train_valid_test_dataset_provider, cfg_container=cfg_container
+                )
             )
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
@@ -5972,25 +5976,86 @@ def get_train_valid_test_num_samples():
     return (train_samples_in_current_phase, eval_samples, test_samples)
 
 
-def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None):
-    """Build pretraining datasets."""
+def build_dataset_runtime_context(
+    cfg_container: Optional[PretrainConfigContainer] = None, tokenizer: Any = None
+) -> DatasetRuntimeContext:
+    """Runtime inputs for ``GPTDatasetConfig.to_core_config()`` in the current run.
+
+    The seed comes from the container; the tokenizer defaults to the run's tokenizer. The parallel
+    sizes and validation flags are still read from the legacy arguments here, until their config
+    sections become authoritative.
+    """
+    args = get_args()
+    cfg = cfg_container if cfg_container is not None else get_run_config()
+    return cfg.dataset_runtime_context(
+        tokenizer if tokenizer is not None else get_tokenizer(),
+        data_parallel_size=args.data_parallel_size,
+        context_parallel_size=args.context_parallel_size,
+        sequence_parallel_size=args.tensor_model_parallel_size * int(bool(args.sequence_parallel)),
+        hybrid_context_parallel=args.hybrid_context_parallel,
+        full_validation=args.full_validation,
+        multiple_validation_sets=args.multiple_validation_sets,
+    )
+
+
+def _declared_provider_keywords(provider: Callable, names: Iterable[str]) -> Tuple[str, ...]:
+    """The entries of ``names`` that ``provider`` declares as parameters and does not already bind.
+
+    Only explicitly named parameters opt in: a bare ``**kwargs`` does not, so existing callbacks
+    are called exactly as before. Keywords bound by a ``functools.partial`` are left untouched.
+    """
+    try:
+        parameters = inspect.signature(provider).parameters
+    except (TypeError, ValueError):
+        return ()
+    bound = getattr(provider, "keywords", None) or {}
+    accepted = (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    return tuple(
+        name
+        for name in names
+        if name in parameters and parameters[name].kind in accepted and name not in bound
+    )
+
+
+def build_train_valid_test_datasets(
+    build_train_valid_test_datasets_provider, train_valid_test_num_samples=None, *, cfg_container=None
+):
+    """Build pretraining datasets.
+
+    A provider that declares ``dataset_config`` / ``context`` parameters receives the declarative
+    ``cfg_container.dataset`` and a ``DatasetRuntimeContext`` built for this run; every other
+    provider is called exactly as before, with the sample counts only. ``cfg_container`` defaults
+    to the run config when one is registered.
+    """
     if train_valid_test_num_samples is None:
         train_valid_test_num_samples = get_train_valid_test_num_samples()
     print_rank_0(' > datasets target sizes (minimum size):')
     print_rank_0('    train:      {}'.format(train_valid_test_num_samples[0]))
     print_rank_0('    validation: {}'.format(train_valid_test_num_samples[1]))
     print_rank_0('    test:       {}'.format(train_valid_test_num_samples[2]))
-    return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
+    provider_kwargs = {}
+    wanted = _declared_provider_keywords(
+        build_train_valid_test_datasets_provider, ("dataset_config", "context")
+    )
+    if wanted:
+        if cfg_container is None and is_run_config_initialized():
+            cfg_container = get_run_config()
+        if cfg_container is not None:
+            if "dataset_config" in wanted:
+                provider_kwargs["dataset_config"] = cfg_container.dataset
+            if "context" in wanted:
+                provider_kwargs["context"] = build_dataset_runtime_context(cfg_container)
+    return build_train_valid_test_datasets_provider(train_valid_test_num_samples, **provider_kwargs)
 
 
-def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider, *, cfg_container=None):
     """Build pretraining data loaders."""
 
     args = get_args()
     train_state = get_train_state()
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
-    cfg = get_run_config()
+    cfg = cfg_container if cfg_container is not None else get_run_config()
 
     (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
 
@@ -6038,7 +6103,9 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
         else:
             # Build datasets.
-            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+                build_train_valid_test_datasets_provider, cfg_container=cfg
+            )
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
             if args.skip_train:
                 train_dataloader = None
@@ -6076,14 +6143,19 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
-def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
-    """Build pretraining data iterators."""
+def build_train_valid_test_data_iterators(
+    build_train_valid_test_datasets_provider, *, cfg_container=None
+):
+    """Build pretraining data iterators.
+
+    ``cfg_container`` is the run's configuration; it defaults to the registered run config.
+    """
 
     args = get_args()
 
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
-        build_train_valid_test_datasets_provider
+        build_train_valid_test_datasets_provider, cfg_container=cfg_container
     )
 
     # Build iterators.
