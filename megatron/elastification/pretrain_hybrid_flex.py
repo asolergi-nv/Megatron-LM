@@ -510,7 +510,7 @@ def _effective_dataset_config(dataset_config):
             "pretrain_hybrid_flex.py builds only the gpt and sft dataset families; building gpt "
             f"for dataset_type={dataset_config.dataset_type!r}, as before."
         )
-        return dataclasses.replace(dataset_config, dataset_type="gpt")
+        return dataset_config.as_family("gpt")
     return dataset_config
 
 

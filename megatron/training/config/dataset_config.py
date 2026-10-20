@@ -5,6 +5,8 @@ Objects here are *declarations*: what the user asked for, with no tokenizer, no 
 derived state, so they serialize and compare cleanly. ``GPTDatasetConfig.to_core_config()`` turns a
 declaration plus a ``DatasetRuntimeContext`` into the Megatron Core runtime object that
 ``BlendedMegatronDatasetBuilder`` consumes; the declaration itself is never mutated by that step.
+``GPTFIMDatasetConfig`` declares the fim family and carries the FIM-only fields; the declaration
+class follows the family (``declaration_class_for_dataset_type``).
 
 Two read-only views of a declaration, neither of which mutates it:
 
@@ -305,7 +307,9 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
     CLI, YAML, Python and Megatron-Bridge recipes declare the same thing, and it is never handed to
     dataset code: ``to_core_config()`` is the only place the two meet; it builds a fresh runtime
     object from the declaration and a ``DatasetRuntimeContext``. Modules that see both classes
-    import the Megatron Core one as ``MCoreGPTDatasetConfig``.
+    import the Megatron Core one as ``MCoreGPTDatasetConfig``. The fim family is declared with the
+    ``GPTFIMDatasetConfig`` subclass, which carries the FIM-only fields (``as_family()`` switches
+    between the two).
     """
 
     # Megatron Core fields redeclared so Python / YAML construction gets the CLI defaults, and so
@@ -402,43 +406,9 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
     implementation is available."""
 
     dataset_type: Literal["gpt", "fim", "varlen", "sft"] = "gpt"
-    """Dataset family the GPT provider builds: gpt (GPTDataset), fim (GPTFIMDataset), varlen
-    (VarlenDataset, variable-length packed THD) or sft (SFTDataset, packed conversations).
-    --sft, --use-varlen-dataset and --fim-data are kept as aliases."""
-
-    fim_rate: float = 0.5
-    """Probability to convert a training sample into a FIM format."""
-
-    fim_spm_rate: float = 0.5
-    """Probability that the a FIM sample uses the SPM format over the PSM format."""
-
-    fim_split_sample: str | None = None
-    """String around which to split the sample for FIM."""
-
-    fim_fragment_rate: float | None = None
-    """Rate of FIM on each fragment when --fim-split-sample is not None."""
-
-    fim_no_prefix: str | None = None
-    """Do not apply FIM to fragments that start with this prefix"""
-
-    fim_prefix_token: str = "<fim_prefix>"
-    """FIM prefix token"""
-
-    fim_middle_token: str = "<fim_middle>"
-    """FIM middle token"""
-
-    fim_suffix_token: str = "<fim_suffix>"
-    """FIM suffix token"""
-
-    fim_pad_token: str = "<fim_pad>"
-    """FIM PAD token"""
-
-    fim_eod_token: str = "<|endoftext|>"
-    """FIM EOD token"""
-
-    fim_extra_tokens: dict[str, str] | None = None
-    """Explicit FIM token mapping with keys prefix, middle, suffix, pad and eod. When None it is
-    built from the five fim_*_token fields."""
+    """Dataset family the GPT provider builds: gpt (GPTDataset), fim (GPTFIMDataset, declared with
+    GPTFIMDatasetConfig), varlen (VarlenDataset, variable-length packed THD) or sft (SFTDataset,
+    packed conversations). --sft, --use-varlen-dataset and --fim-data are kept as aliases."""
 
     def __post_init__(self) -> None:
         """Megatron Core's post-init needs a tokenizer; it runs on the runtime object instead."""
@@ -449,6 +419,42 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
         return self.dataset_type == "sft" or (
             self.dataset_type == "varlen" and not self.varlen_sbhd_validation
         )
+
+    def _check_family_matches_class(self, dataset_type: str) -> None:
+        """The fim family is declared with ``GPTFIMDatasetConfig`` and nothing else is.
+
+        The FIM-only fields live on that subclass, so the class and the selector must agree. Checked
+        by ``validate()`` and again by ``to_core_config()``, which tools call without a container.
+        """
+        declares_fim = isinstance(self, GPTFIMDatasetConfig)
+        if dataset_type == "fim" and not declares_fim:
+            raise ValueError(
+                "dataset_type='fim' must be declared with GPTFIMDatasetConfig (--fim-data / "
+                "--dataset-type fim build one); the FIM fields live on that class."
+            )
+        if declares_fim and dataset_type != "fim":
+            raise ValueError(
+                f"GPTFIMDatasetConfig declares the fim family; got dataset_type={dataset_type!r}. "
+                "Use as_family() or declare a GPTDatasetConfig for another family."
+            )
+
+    def as_family(self, dataset_type: str) -> "GPTDatasetConfig":
+        """A new declaration of another family with the same shared fields; ``self`` is unchanged.
+
+        Entry points that build a different family than the one requested (hybrid builds gpt for
+        a fim request) use this instead of ``dataclasses.replace(..., dataset_type=...)``: the
+        declaration class follows the family (``GPTFIMDatasetConfig`` for fim), so the FIM-only
+        fields are dropped when leaving the fim family and take their defaults when entering it.
+        """
+        target = declaration_class_for_dataset_type(dataset_type)
+        shared = {f.name for f in fields(self) if f.init}
+        kwargs: dict[str, Any] = {}
+        for f in fields(target):
+            if not f.init or f.name not in shared or f.name == "dataset_type":
+                continue
+            value = getattr(self, f.name)
+            kwargs[f.name] = value if f.name == "tokenizer" else deepcopy(value)
+        return target(dataset_type=dataset_type, **kwargs)
 
     def _normalized_fields(self) -> dict[str, Any]:
         """Declared inputs after the spelling normalizations; never mutates ``self``.
@@ -523,7 +529,8 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
         spelling rules that only Python / YAML declarations can break, plus one gap closed here:
         ``mock_data`` next to a file-backed source (``data_args_path`` /
         ``per_split_data_args_path``), which ``validate_args`` accepts and no entry point could
-        build. Cross-section checks (parallelism, schedulers) stay in ``validate_args``.
+        build. Cross-section checks (parallelism, schedulers) stay in ``validate_args``; the FIM
+        checks live on ``GPTFIMDatasetConfig.validate()``.
         """
         n = self._resolved_fields()
         if n["dataloader_type"] not in DATALOADER_TYPES:
@@ -534,6 +541,7 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
             raise ValueError(
                 f"dataset_type must be one of {DATASET_TYPES}, got {self.dataset_type!r}."
             )
+        self._check_family_matches_class(n["dataset_type"])
         per_split_paths = (n["train_data_path"], n["valid_data_path"], n["test_data_path"])
         uses_per_split_paths = any(p is not None for p in per_split_paths)
         # One way of declaring each data source (a serialized config cannot carry two).
@@ -576,22 +584,6 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
                 "--varlen-sbhd-validation is not supported with --mock-data; "
                 "SBHD validation requires a real dataset."
             )
-        if n["dataset_type"] == "fim":
-            if n["mock_data"]:
-                raise ValueError("Mock dataset is not supported with FIM dataset.")
-            if not n["fim_rate"]:
-                raise ValueError("--fim-rate should be specified.")
-            if not n["fim_spm_rate"]:
-                raise ValueError("--fim-spm-rate should be specified.")
-            tokens = (
-                n["fim_prefix_token"],
-                n["fim_middle_token"],
-                n["fim_suffix_token"],
-                n["fim_pad_token"],
-                n["fim_eod_token"],
-            )
-            if n["fim_extra_tokens"] is None and any(token is None for token in tokens):
-                raise ValueError("FIM extra tokens should be specified.")
 
     def finalize(self) -> None:
         """Write the normalized view into the declaration (idempotent).
@@ -610,34 +602,20 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
         for name, value in normalized.items():
             setattr(self, name, value)
 
-    def to_core_config(
-        self, context: DatasetRuntimeContext, *, exclude: Collection[str] = ()
-    ) -> MCoreGPTDatasetConfig:
-        """Build the Megatron Core runtime config that ``BlendedMegatronDatasetBuilder`` consumes.
+    def _core_kwargs(
+        self, context: DatasetRuntimeContext, *, exclude: Collection[str]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Constructor keywords of the Megatron Core config, and the resolved view they came from.
 
-        Non-mutating: ``self`` is never modified and every call returns a new object, so changed
-        declarations or runtime inputs are always reflected (it does read the files the declaration
-        names: data-args and per-dataset-sequences JSON, through the same ``get_blend_and_blend_per_split``
-        helper the legacy factories call). Returns the runtime
-        ``megatron.training.datasets.fim_dataset.GPTFIMDatasetConfig`` when ``dataset_type == "fim"``
-        and a plain Megatron Core ``GPTDatasetConfig`` otherwise.
-
-        Args:
-            context: tokenizer and runtime inputs; a value set on the context wins over the
-                declaration.
-            exclude: constructor keywords an entry point does not forward. They are left out of the
-                call entirely, so Megatron Core's own defaults apply, exactly as for a factory that
-                never passed them. Names that are not Megatron Core constructor keywords are
-                rejected, so a misspelled policy cannot silently change what is built.
+        Shared by ``to_core_config()`` and the ``GPTFIMDatasetConfig`` override, so that each
+        runtime object is constructed exactly once from one set of keywords.
         """
-        from megatron.training.datasets.fim_dataset import (
-            GPTFIMDatasetConfig as RuntimeGPTFIMDatasetConfig,
-        )
         from megatron.training.utils import get_blend_and_blend_per_split
 
         if context.tokenizer is None:
             raise ValueError("A built tokenizer is required to build the dataset config.")
         n = self._resolved_fields()
+        self._check_family_matches_class(n["dataset_type"])
         if n["seq_length"] is None:
             raise ValueError("seq_length is required to build a GPT dataset config.")
         exclude = set(exclude)
@@ -686,24 +664,30 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
                 kwargs["sequences_per_dataset"] = json.load(f)
         for name in exclude:
             kwargs.pop(name, None)
-        if n["dataset_type"] != "fim":
-            return MCoreGPTDatasetConfig(**kwargs)
-        fim_extra_tokens = deepcopy(n["fim_extra_tokens"]) or {
-            "prefix": n["fim_prefix_token"],
-            "middle": n["fim_middle_token"],
-            "suffix": n["fim_suffix_token"],
-            "pad": n["fim_pad_token"],
-            "eod": n["fim_eod_token"],
-        }
-        return RuntimeGPTFIMDatasetConfig(
-            **kwargs,
-            fim_rate=n["fim_rate"],
-            fim_spm_rate=n["fim_spm_rate"],
-            fim_extra_tokens=fim_extra_tokens,
-            fim_split_sample=n["fim_split_sample"],
-            fim_fragment_rate=n["fim_fragment_rate"],
-            fim_no_prefix=n["fim_no_prefix"],
-        )
+        return kwargs, n
+
+    def to_core_config(
+        self, context: DatasetRuntimeContext, *, exclude: Collection[str] = ()
+    ) -> MCoreGPTDatasetConfig:
+        """Build the Megatron Core runtime config that ``BlendedMegatronDatasetBuilder`` consumes.
+
+        Non-mutating: ``self`` is never modified and every call returns a new object, so changed
+        declarations or runtime inputs are always reflected (it does read the files the declaration
+        names: data-args and per-dataset-sequences JSON, through the same ``get_blend_and_blend_per_split``
+        helper the legacy factories call). Returns a plain Megatron Core ``GPTDatasetConfig``;
+        ``GPTFIMDatasetConfig`` overrides it to return the runtime
+        ``megatron.training.datasets.fim_dataset.GPTFIMDatasetConfig``.
+
+        Args:
+            context: tokenizer and runtime inputs; a value set on the context wins over the
+                declaration.
+            exclude: constructor keywords an entry point does not forward. They are left out of the
+                call entirely, so Megatron Core's own defaults apply, exactly as for a factory that
+                never passed them. Names that are not Megatron Core constructor keywords are
+                rejected, so a misspelled policy cannot silently change what is built.
+        """
+        kwargs, _ = self._core_kwargs(context, exclude=exclude)
+        return MCoreGPTDatasetConfig(**kwargs)
 
     def to_cfg_dict(self) -> dict[str, Any]:
         """Serialize the normalized declared inputs: no tokenizer, no derived state, no
@@ -729,6 +713,108 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
 
 @dataclass(kw_only=True)
 class GPTFIMDatasetConfig(GPTDatasetConfig):
-    """Preset: GPT dataset configuration with fill-in-the-middle enabled."""
+    """Declarative GPT dataset configuration with fill-in-the-middle (``dataset_type="fim"``).
+
+    The FIM-only fields live here, mirroring the runtime split (the runtime
+    ``megatron.training.datasets.fim_dataset.GPTFIMDatasetConfig`` extends the Megatron Core config)
+    and Megatron-Bridge's ``GPTFIMDatasetConfig``. ``--fim-data`` / ``--dataset-type fim`` build this
+    class, a plain ``GPTDatasetConfig`` cannot declare the fim family, and this class declares no
+    other; the data argument group is generated from it, so one CLI group covers both classes.
+    """
 
     dataset_type: Literal["gpt", "fim", "varlen", "sft"] = "fim"
+
+    fim_rate: float = 0.5
+    """Probability to convert a training sample into a FIM format."""
+
+    fim_spm_rate: float = 0.5
+    """Probability that the a FIM sample uses the SPM format over the PSM format."""
+
+    fim_split_sample: str | None = None
+    """String around which to split the sample for FIM."""
+
+    fim_fragment_rate: float | None = None
+    """Rate of FIM on each fragment when --fim-split-sample is not None."""
+
+    fim_no_prefix: str | None = None
+    """Do not apply FIM to fragments that start with this prefix"""
+
+    fim_prefix_token: str = "<fim_prefix>"
+    """FIM prefix token"""
+
+    fim_middle_token: str = "<fim_middle>"
+    """FIM middle token"""
+
+    fim_suffix_token: str = "<fim_suffix>"
+    """FIM suffix token"""
+
+    fim_pad_token: str = "<fim_pad>"
+    """FIM PAD token"""
+
+    fim_eod_token: str = "<|endoftext|>"
+    """FIM EOD token"""
+
+    fim_extra_tokens: dict[str, str] | None = None
+    """Explicit FIM token mapping with keys prefix, middle, suffix, pad and eod. When None it is
+    built from the five fim_*_token fields."""
+
+    def validate(self) -> None:
+        """The shared checks, then the FIM checks ``validate_args`` applies to ``--fim-data``."""
+        super().validate()
+        n = self._resolved_fields()
+        if n["mock_data"]:
+            raise ValueError("Mock dataset is not supported with FIM dataset.")
+        if not n["fim_rate"]:
+            raise ValueError("--fim-rate should be specified.")
+        if not n["fim_spm_rate"]:
+            raise ValueError("--fim-spm-rate should be specified.")
+        tokens = (
+            n["fim_prefix_token"],
+            n["fim_middle_token"],
+            n["fim_suffix_token"],
+            n["fim_pad_token"],
+            n["fim_eod_token"],
+        )
+        if n["fim_extra_tokens"] is None and any(token is None for token in tokens):
+            raise ValueError("FIM extra tokens should be specified.")
+
+    def to_core_config(
+        self, context: DatasetRuntimeContext, *, exclude: Collection[str] = ()
+    ) -> MCoreGPTDatasetConfig:
+        """Build the runtime ``megatron.training.datasets.fim_dataset.GPTFIMDatasetConfig``.
+
+        The shared keywords come from the base class, the FIM extras are added, and the runtime
+        object is constructed once. ``fim_extra_tokens`` defaults to the five ``fim_*_token`` fields.
+        """
+        from megatron.training.datasets.fim_dataset import (
+            GPTFIMDatasetConfig as RuntimeGPTFIMDatasetConfig,
+        )
+
+        kwargs, n = self._core_kwargs(context, exclude=exclude)
+        fim_extra_tokens = deepcopy(n["fim_extra_tokens"]) or {
+            "prefix": n["fim_prefix_token"],
+            "middle": n["fim_middle_token"],
+            "suffix": n["fim_suffix_token"],
+            "pad": n["fim_pad_token"],
+            "eod": n["fim_eod_token"],
+        }
+        return RuntimeGPTFIMDatasetConfig(
+            **kwargs,
+            fim_rate=n["fim_rate"],
+            fim_spm_rate=n["fim_spm_rate"],
+            fim_extra_tokens=fim_extra_tokens,
+            fim_split_sample=n["fim_split_sample"],
+            fim_fragment_rate=n["fim_fragment_rate"],
+            fim_no_prefix=n["fim_no_prefix"],
+        )
+
+
+def declaration_class_for_dataset_type(dataset_type: str) -> type[GPTDatasetConfig]:
+    """The declaration class of a dataset family: ``GPTFIMDatasetConfig`` for fim, else the base.
+
+    The CLI factory and ``as_family()`` select the class with it, so the class and the selector
+    always agree.
+    """
+    if dataset_type not in DATASET_TYPES:
+        raise ValueError(f"dataset_type must be one of {DATASET_TYPES}, got {dataset_type!r}.")
+    return GPTFIMDatasetConfig if dataset_type == "fim" else GPTDatasetConfig

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""The data argument group is generated from GPTDatasetConfig and keeps the legacy CLI contract.
+"""The data argument group is generated from GPTFIMDatasetConfig (the GPTDatasetConfig fields plus the
+FIM-only ones) and keeps the legacy CLI contract.
 
 ``legacy_data_arguments.json`` is a snapshot of the data-related argparse actions of the parser
 before the group was generated (Megatron-LM commit 438ef0025): option strings, dest, default,
@@ -22,7 +23,7 @@ from megatron.training.argument_utils import (
     gpt_dataset_config_from_args,
 )
 from megatron.training.arguments import parse_args, validate_args
-from megatron.training.config import GPTDatasetConfig
+from megatron.training.config import GPTDatasetConfig, GPTFIMDatasetConfig
 from megatron.training.config.dataset_config import (
     DATASET_CLI_EXCLUDE,
     LEGACY_ALIAS_FLAGS,
@@ -98,10 +99,15 @@ def test_dataset_type_is_the_only_new_data_argument():
     arguments._add_data_args(data_only)
     generated = set(_actions_by_dest(data_only))
     assert generated - legacy_dests == {"dataset_type"}
-    # Every field of the declaration that is not excluded has a flag, and nothing else does.
+    # Every field of the declaration classes that is not excluded has a flag, and nothing else
+    # does: the group is generated from GPTFIMDatasetConfig, whose fields are the base fields plus
+    # the FIM-only ones.
+    assert set(GPTDatasetConfig.__dataclass_fields__) < set(
+        GPTFIMDatasetConfig.__dataclass_fields__
+    )
     expected = {
         LEGACY_ARG_MAP.get(f.name, {}).get("dest", f.name)
-        for f in GPTDatasetConfig.__dataclass_fields__.values()
+        for f in GPTFIMDatasetConfig.__dataclass_fields__.values()
         if f.init and f.name not in DATASET_CLI_EXCLUDE
     }
     expected |= {dest for dest, _family in LEGACY_ALIAS_FLAGS.values()}
@@ -388,5 +394,6 @@ def test_declaration_validation_accepts_everything_validate_args_accepts(extra):
     args = _validated(extra)
     declared = gpt_dataset_config_from_args(args)
     declared.validate()
+    assert isinstance(declared, GPTFIMDatasetConfig) is bool(args.fim_data)
     assert declared.create_attention_mask == args.create_attention_mask_in_dataloader
     assert declared.dataloader_type == args.dataloader_type

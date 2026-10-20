@@ -403,7 +403,7 @@ def _effective_dataset_config(dataset_config):
             "pretrain_hybrid.py does not build FIM datasets; building the gpt dataset family for "
             "dataset_type='fim' (--fim-data), as before."
         )
-        return dataclasses.replace(dataset_config, dataset_type="gpt")
+        return dataset_config.as_family("gpt")
     return dataset_config
 
 

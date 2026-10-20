@@ -25,10 +25,18 @@ from megatron.training.config.dataset_config import (
     LEGACY_ARG_MAP,
     LEGACY_SPLIT_DEFAULT,
     dataset_type_from_args,
+    declaration_class_for_dataset_type,
     project_dataset_type_into_args,
 )
 from megatron.training.config.instantiate_utils import instantiate
 from megatron.training.datasets.fim_dataset import GPTFIMDatasetConfig as RuntimeGPTFIMDatasetConfig
+
+
+def _declaration(**kwargs):
+    """The declaration class follows the family: GPTFIMDatasetConfig for fim, the base otherwise."""
+    cls = GPTFIMDatasetConfig if kwargs.get("dataset_type") == "fim" else GPTDatasetConfig
+    return cls(**kwargs)
+
 
 # Keywords the hybrid-flex factory never forwarded (its runtime policy in PR-1).
 FLEX_OMITTED = frozenset(
@@ -300,7 +308,7 @@ def test_round_trip_keeps_field_dependent_defaults_editable(tokenizer):
     ],
 )
 def test_validation_rejects_the_same_inputs_as_validate_args(overrides, message):
-    cfg = GPTDatasetConfig(seq_length=16, **overrides)
+    cfg = _declaration(seq_length=16, **overrides)
     before = _raw(cfg)
     with pytest.raises(ValueError, match=message):
         cfg.validate()
@@ -315,7 +323,6 @@ def test_validation_rejects_the_same_inputs_as_validate_args(overrides, message)
         dict(mock_data=True, data_path=[]),  # an empty --data-path does not count as a source
         dict(dataset_type="fim", fim_pad_token=None, fim_extra_tokens={"pad": "<p>"}),
         dict(dataset_type="varlen", varlen_sbhd_validation=True),
-        dict(dataset_type="gpt", fim_rate=0.0, fim_spm_rate=0.0),
         dict(dataset_type="sft", mock_data=True),
         dict(fast_cache_load=True),  # Megatron Core checks the cache path at build time
         dict(defer_npy_index_mmap=True),
@@ -329,7 +336,7 @@ def test_validation_rejects_the_same_inputs_as_validate_args(overrides, message)
 def test_validation_accepts_neighbouring_inputs(overrides):
     kwargs = dict(seq_length=16)
     kwargs.update(overrides)
-    GPTDatasetConfig(**kwargs).validate()
+    _declaration(**kwargs).validate()
 
 
 def test_cache_prerequisites_are_enforced_by_megatron_core_not_the_declaration(tokenizer):
@@ -497,8 +504,7 @@ def test_fim_declaration_builds_the_runtime_fim_config(tokenizer):
         "eod": "<|endoftext|>",
     }
     assert core.fim_split_sample is None and core.fim_fragment_rate is None
-    explicit = GPTDatasetConfig(
-        dataset_type="fim",
+    explicit = GPTFIMDatasetConfig(
         seq_length=16,
         data_path=["a"],
         split="1,1,1",
@@ -507,8 +513,69 @@ def test_fim_declaration_builds_the_runtime_fim_config(tokenizer):
     core = explicit.to_core_config(_context(tokenizer))
     assert core.fim_extra_tokens["prefix"] == "P"
     assert core.fim_extra_tokens is not explicit.fim_extra_tokens
-    plain = GPTDatasetConfig(seq_length=16, data_path=["a"], split="1,1,1", fim_rate=0.9)
+    plain = GPTDatasetConfig(seq_length=16, data_path=["a"], split="1,1,1")
+    assert not hasattr(plain, "fim_rate")  # the FIM fields live on the subclass
     assert type(plain.to_core_config(_context(tokenizer))) is MCoreGPTDatasetConfig
+
+
+FIM_ONLY_FIELDS = {
+    "fim_rate", "fim_spm_rate", "fim_split_sample", "fim_fragment_rate", "fim_no_prefix",
+    "fim_prefix_token", "fim_middle_token", "fim_suffix_token", "fim_pad_token", "fim_eod_token",
+    "fim_extra_tokens",
+}  # fmt: skip
+
+
+def test_fim_fields_live_on_the_subclass_only():
+    base = {f.name for f in fields(GPTDatasetConfig)}
+    fim = {f.name for f in fields(GPTFIMDatasetConfig)}
+    assert fim - base == FIM_ONLY_FIELDS and not {name for name in base if name.startswith("fim_")}
+    assert declaration_class_for_dataset_type("fim") is GPTFIMDatasetConfig
+    for family in ("gpt", "varlen", "sft"):
+        assert declaration_class_for_dataset_type(family) is GPTDatasetConfig
+    with pytest.raises(ValueError, match="dataset_type"):
+        declaration_class_for_dataset_type("other")
+
+
+def test_fim_family_and_declaration_class_must_agree(tokenizer):
+    """Checked at validation and again at conversion (tools convert without a container)."""
+    base = GPTDatasetConfig(seq_length=16, data_path=["a"], split="1,1,1", dataset_type="fim")
+    with pytest.raises(ValueError, match="GPTFIMDatasetConfig"):
+        base.validate()
+    with pytest.raises(ValueError, match="GPTFIMDatasetConfig"):
+        base.to_core_config(_context(tokenizer))
+    other = GPTFIMDatasetConfig(seq_length=16, data_path=["a"], split="1,1,1", dataset_type="gpt")
+    with pytest.raises(ValueError, match="declares the fim family"):
+        other.validate()
+    with pytest.raises(ValueError, match="declares the fim family"):
+        other.to_core_config(_context(tokenizer))
+    assert base.dataset_type == "fim" and other.dataset_type == "gpt"  # nothing was mutated
+
+
+def test_as_family_switches_the_declaration_class(tokenizer):
+    requested = GPTFIMDatasetConfig(
+        seq_length=16,
+        data_path="a b",
+        split="1,1,1",
+        num_workers=0,
+        fim_rate=0.9,
+        fim_eod_token="<e>",
+    )
+    plain = requested.as_family("gpt")
+    assert type(plain) is GPTDatasetConfig and plain.dataset_type == "gpt"
+    assert plain.data_path == "a b" and plain.num_workers == 0  # raw shared fields, as declared
+    assert not hasattr(plain, "fim_rate")
+    assert type(requested) is GPTFIMDatasetConfig and requested.dataset_type == "fim"
+    assert requested.fim_rate == 0.9  # the request is unchanged
+    plain.validate()
+    assert type(plain.to_core_config(_context(tokenizer))) is MCoreGPTDatasetConfig
+    back = plain.as_family("fim")
+    assert type(back) is GPTFIMDatasetConfig and back.dataset_type == "fim"
+    assert back.fim_rate == 0.5 and back.fim_eod_token == "<|endoftext|>"  # defaults, not copies
+    assert back.data_path == "a b" and back.num_workers == 0
+    same = plain.as_family("varlen")
+    assert type(same) is GPTDatasetConfig and same.dataset_type == "varlen" and same is not plain
+    with pytest.raises(ValueError, match="dataset_type"):
+        plain.as_family("other")
 
 
 def test_serialization_round_trip(tokenizer):
@@ -546,6 +613,8 @@ def test_serialization_round_trip(tokenizer):
     preset = PretrainConfigContainer._convert_value_to_dict(GPTFIMDatasetConfig(seq_length=8))
     assert preset["_target_"].endswith("GPTFIMDatasetConfig") and preset["dataset_type"] == "fim"
     assert type(instantiate(preset)) is GPTFIMDatasetConfig
+    assert preset["fim_rate"] == 0.5 and preset["fim_eod_token"] == "<|endoftext|>"
+    assert not any(key.startswith("fim_") for key in serialized)  # plain GPT carries no FIM keys
 
 
 def test_inter_document_masking_disables_the_dataloader_attention_mask(tokenizer):
@@ -663,7 +732,7 @@ def test_runtime_context_from_args():
     ],
 )
 def test_is_packed_sequence(overrides, packed):
-    assert GPTDatasetConfig(**overrides).is_packed_sequence is packed
+    assert _declaration(**overrides).is_packed_sequence is packed
 
 
 def test_dataloader_config_lifecycle():

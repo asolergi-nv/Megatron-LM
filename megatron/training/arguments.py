@@ -3254,7 +3254,7 @@ def _add_tokenizer_args(parser):
 
 
 def _add_data_args(parser):
-    from megatron.training.config import GPTDatasetConfig
+    from megatron.training.config import GPTFIMDatasetConfig
     from megatron.training.config.dataset_config import (
         DATASET_CLI_EXCLUDE,
         LEGACY_ALIAS_FLAGS,
@@ -3262,11 +3262,12 @@ def _add_data_args(parser):
         LEGACY_ARG_MAP,
     )
 
-    # The flags, dests and defaults are those of the GPTDatasetConfig fields; LEGACY_ARG_MAP keeps
+    # The flags, dests and defaults are those of the GPTFIMDatasetConfig fields (the GPTDatasetConfig
+    # fields plus the FIM-only ones, so one group serves both classes); LEGACY_ARG_MAP keeps
     # the historical spellings and LEGACY_ALIAS_FLAGS the family flags (--sft, --use-varlen-dataset,
     # --fim-data) as aliases of --dataset-type.
     data_factory = DatasetArgumentGroupFactory(
-        GPTDatasetConfig,
+        GPTFIMDatasetConfig,
         legacy=LEGACY_ARG_MAP,
         aliases=LEGACY_ALIAS_FLAGS,
         alias_help=LEGACY_ALIAS_HELP,

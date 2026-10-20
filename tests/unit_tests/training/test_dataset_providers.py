@@ -26,6 +26,8 @@ from megatron.training import global_vars, training
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import GPTDatasetConfig
+from megatron.training.config import GPTFIMDatasetConfig as DeclarativeGPTFIMDatasetConfig
+from megatron.training.config.dataset_config import declaration_class_for_dataset_type
 from megatron.training.datasets import sft_dataset, varlen_dataset
 from megatron.training.datasets.fim_dataset import GPTFIMDatasetConfig
 from tests.unit_tests.test_utilities import Utils
@@ -257,7 +259,7 @@ def test_fim_declaration_without_a_source_is_rejected(monkeypatch, corpus):
     _, cfg, context = _prepare(monkeypatch, *corpus["mock"])
     with pytest.raises(ValueError, match="declare a data source"):
         _entry_point("gpt")._resolve_dataset_build(
-            GPTDatasetConfig(dataset_type="fim", seq_length=32), context
+            DeclarativeGPTFIMDatasetConfig(seq_length=32), context
         )
 
 
@@ -278,11 +280,22 @@ def test_entry_point_policies_warn_when_they_substitute_the_family(
     module = _entry_point(entry_point)
     warnings = []
     monkeypatch.setattr(module, "warn_rank_0", warnings.append)
-    requested = GPTDatasetConfig(dataset_type=dataset_type, seq_length=32, data_path=["prefix-a"])
+    requested = declaration_class_for_dataset_type(dataset_type)(
+        dataset_type=dataset_type, seq_length=32, data_path=["prefix-a"]
+    )
     effective = module._effective_dataset_config(requested)
     assert requested.dataset_type == dataset_type
     assert effective.dataset_type == ("gpt" if warns else dataset_type)
     assert len(warnings) == int(warns)
+    if warns:
+        # The projection is a base-class declaration (a fim request drops the FIM fields) and
+        # the requested declaration is untouched.
+        assert type(effective) is GPTDatasetConfig and effective is not requested
+        assert not hasattr(effective, "fim_rate")
+        assert effective.data_path == ["prefix-a"] and effective.seq_length == 32
+        assert type(effective.to_core_config(context)) is MCoreGPTDatasetConfig
+    else:
+        assert effective is requested
     if warns:
         assert dataset_type in warnings[0] and "as before" in warnings[0]
 

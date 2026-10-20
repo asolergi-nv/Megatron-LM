@@ -30,7 +30,11 @@ from megatron.training.config import (
     InferenceSetupConfig,
     PretrainConfigContainer,
 )
-from megatron.training.config.dataset_config import DATASET_CLI_EXCLUDE, LEGACY_ARG_MAP
+from megatron.training.config.dataset_config import (
+    DATASET_CLI_EXCLUDE,
+    LEGACY_ARG_MAP,
+    declaration_class_for_dataset_type,
+)
 from megatron.training.config.yaml_utils import safe_yaml_representers
 
 DATA_ARGV = [
@@ -128,7 +132,9 @@ def test_container_from_args_declares_every_data_argument(monkeypatch):
         dataset.mmap_bin_files is False and dataset.per_dataset_sequences_path == "/sequences.json"
     )
     assert dataset.phase_transition_iterations == "20,10"  # a raw namespace; validate_args sorts it
-    assert dataset.fim_rate == 0.9 and dataset.fim_eod_token == "<e>"
+    # The FIM flags are parsed but belong to GPTFIMDatasetConfig: without --fim-data the
+    # declaration is a plain GPTDatasetConfig and does not carry them.
+    assert not any(item.name.startswith("fim_") for item in fields(dataset))
     assert dataset.dataset_type == "gpt" and not dataset.mock_data
     # Runtime inputs are not declared from the CLI.
     assert dataset.tokenizer is None and dataset.random_seed is None
@@ -137,6 +143,19 @@ def test_container_from_args_declares_every_data_argument(monkeypatch):
     assert dataset.pin_memory and dataset.persistent_workers and dataset.drop_last
     loader = dataloader_config_from_args(args)
     assert loader == DataloaderConfig(dataloader_type="cyclic", num_workers=0, data_sharding=False)
+
+
+def test_container_from_args_declares_the_fim_fields_on_the_fim_class(monkeypatch):
+    args, cfg = _container_from_argv(monkeypatch, [*DATA_ARGV, "--fim-data"])
+    dataset = cfg.dataset
+    assert type(dataset) is GPTFIMDatasetConfig and dataset.dataset_type == "fim"
+    for item in fields(GPTFIMDatasetConfig):
+        if item.name.startswith("fim_") and item.name not in DATASET_CLI_EXCLUDE:
+            assert getattr(dataset, item.name) == getattr(args, item.name), item.name
+    assert dataset.fim_rate == 0.9 and dataset.fim_split_sample == "<split>"
+    assert dataset.fim_prefix_token == "<p>" and dataset.fim_eod_token == "<e>"
+    assert dataset.fim_extra_tokens is None  # YAML / Python only
+    assert dataset.seq_length == 64 and dataset.num_workers == 0  # the shared fields, as before
 
 
 @pytest.mark.parametrize(
@@ -151,7 +170,9 @@ def test_container_from_args_declares_every_data_argument(monkeypatch):
 def test_alias_flags_select_the_dataset_family(argv, dataset_type):
     dataset = gpt_dataset_config_from_args(_parse(argv))
     assert dataset.dataset_type == dataset_type
-    assert dataset == GPTDatasetConfig(dataset_type=dataset_type)
+    declaration_class = declaration_class_for_dataset_type(dataset_type)
+    assert type(dataset) is declaration_class
+    assert dataset == declaration_class(dataset_type=dataset_type)
 
 
 def test_cli_defaults_build_the_default_declaration():
@@ -231,13 +252,15 @@ def test_invalid_dataset_declaration_blocks_finalization(run_config):
 
 
 def test_serialization_round_trip_keeps_the_dataset_section(run_config, tmp_path):
-    run_config.dataset = GPTDatasetConfig(
-        seq_length=32, data_path=["prefix-a"], split="9,1,0", dataset_type="fim", fim_rate=0.9
+    run_config.dataset = GPTFIMDatasetConfig(
+        seq_length=32, data_path=["prefix-a"], split="9,1,0", fim_rate=0.9
     )
     serialized = run_config.to_dict()
-    assert serialized["dataset"]["_target_"].endswith("GPTDatasetConfig")
+    assert serialized["dataset"]["_target_"].endswith(".GPTFIMDatasetConfig")
+    assert serialized["dataset"]["fim_rate"] == 0.9
     assert "tokenizer" not in serialized["dataset"] and "mock" not in serialized["dataset"]
     restored = PretrainConfigContainer.from_dict(serialized)
+    assert type(restored.dataset) is GPTFIMDatasetConfig
     assert _same_declaration(restored.dataset, run_config.dataset)
     assert restored.dataset != run_config.dataset  # the raw spelling was normalized on output
     assert restored.to_dict() == serialized

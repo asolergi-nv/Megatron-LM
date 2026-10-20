@@ -7,7 +7,6 @@ Unsupported configurations:
 """
 
 import argparse
-import dataclasses
 from typing import Any, Dict, Optional
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
@@ -134,7 +133,7 @@ _OMITTED_CORE_FIELDS = frozenset(
 def _effective_dataset_config(dataset_config):
     """Cache preparation builds the plain GPT dataset whatever family was requested, as before."""
     if dataset_config.dataset_type != "gpt":
-        return dataclasses.replace(dataset_config, dataset_type="gpt")
+        return dataset_config.as_family("gpt")
     return dataset_config
 
 

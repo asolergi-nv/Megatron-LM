@@ -45,6 +45,7 @@ from megatron.training.config.dataset_config import (
     DATASET_CLI_EXCLUDE,
     LEGACY_ARG_MAP,
     dataset_type_from_args,
+    declaration_class_for_dataset_type,
 )
 from megatron.training.models import GPTModelConfig, HybridModelConfig
 
@@ -862,17 +863,21 @@ def gpt_dataset_config_from_args(args: Namespace) -> GPTDatasetConfig:
 
     Field values come from the ``args`` attribute of the same name, or the legacy ``dest`` in
     ``LEGACY_ARG_MAP``; attributes missing from ``args`` keep the dataclass defaults. The dataset
-    family comes from ``--dataset-type`` and its alias flags, resolved as ``validate_args`` did.
+    family comes from ``--dataset-type`` and its alias flags, resolved as ``validate_args`` did,
+    and selects the declaration class: ``GPTFIMDatasetConfig`` for fim (it carries the FIM
+    fields), ``GPTDatasetConfig`` otherwise.
     """
     renames = {name: spec["dest"] for name, spec in LEGACY_ARG_MAP.items() if "dest" in spec}
-    kwargs = {"dataset_type": dataset_type_from_args(args, warn=False)}
-    for f in fields(GPTDatasetConfig):
+    dataset_type = dataset_type_from_args(args, warn=False)
+    declaration_class = declaration_class_for_dataset_type(dataset_type)
+    kwargs = {"dataset_type": dataset_type}
+    for f in fields(declaration_class):
         if not f.init or f.name in DATASET_CLI_EXCLUDE or f.name == "dataset_type":
             continue
         src = renames.get(f.name, f.name)
         if hasattr(args, src):
             kwargs[f.name] = deepcopy(getattr(args, src))
-    return GPTDatasetConfig(**kwargs)
+    return declaration_class(**kwargs)
 
 
 def dataloader_config_from_args(args: Namespace) -> DataloaderConfig:
