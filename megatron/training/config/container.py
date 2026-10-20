@@ -307,7 +307,8 @@ class PretrainConfigContainer(ConfigContainerBase):
     dataset: GPTDatasetConfig | DataloaderConfig
     """Declarative dataset and dataloader settings. GPT entry points build their datasets from it
     through ``GPTDatasetConfig.to_core_config()``; entry points with their own data pipeline carry
-    at least the loader settings."""
+    at least the loader settings. Both classes implement ``validate()`` and ``finalize()``; the
+    container calls them directly."""
     ddp: DistributedDataParallelConfig = field(default_factory=DistributedDataParallelConfig)
     dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
     rng: RNGConfig = field(default_factory=RNGConfig)
@@ -367,9 +368,7 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     def _finalize(self) -> None:
         super()._finalize()
-        finalize_dataset = getattr(self.dataset, "finalize", None)
-        if callable(finalize_dataset):
-            finalize_dataset()
+        self.dataset.finalize()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
 

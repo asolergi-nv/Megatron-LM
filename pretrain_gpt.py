@@ -25,7 +25,9 @@ from gpt_builders import gpt_builder
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
-from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.gpt_dataset import GPTDataset
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig as MCoreGPTDatasetConfig
+from megatron.core.datasets.gpt_dataset import MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.package_info import __version__ as mcore_version
@@ -447,7 +449,7 @@ def _resolve_dataset_build(dataset_config, context):
     return _DATASET_CLASSES[key], config, dataset_config.is_packed_sequence
 
 
-def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
+def core_gpt_dataset_config_from_args(args: Any) -> MCoreGPTDatasetConfig:
     """Build the GPT (or FIM) runtime dataset config from parsed CLI args.
 
     Kept for callers of the legacy shape; the provider builds from ``cfg.dataset`` instead. As

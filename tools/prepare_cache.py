@@ -11,7 +11,8 @@ import dataclasses
 from typing import Any, Dict, Optional
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
+from megatron.core.datasets.gpt_dataset import GPTDataset
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig as MCoreGPTDatasetConfig
 from megatron.core.datasets.utils import compile_helpers
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training import get_train_valid_test_num_samples
@@ -137,8 +138,8 @@ def _effective_dataset_config(dataset_config):
     return dataset_config
 
 
-def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
-    """Build the explicit GPTDatasetConfig used for offline cache preparation.
+def core_gpt_dataset_config_from_args(args: Any) -> MCoreGPTDatasetConfig:
+    """Build the explicit Megatron Core GPTDatasetConfig used for offline cache preparation.
 
     The declaration comes from the legacy arguments (``gpt_dataset_config_from_args``); as
     before, the seed is ``args.seed`` and a tokenizer is built from ``args``.

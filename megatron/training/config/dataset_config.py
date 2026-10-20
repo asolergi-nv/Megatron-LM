@@ -296,9 +296,16 @@ def _as_blend(blend: Any) -> tuple[list[str], list[float] | None] | None:
 class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
     """Declarative GPT dataset configuration (``PretrainConfigContainer.dataset``).
 
-    Inherits the Megatron Core field names so that CLI, YAML, Python and Megatron-Bridge recipes
-    declare the same thing. It is never handed to dataset code: ``to_core_config()`` builds the
-    runtime object from the declaration and a ``DatasetRuntimeContext``.
+    Two classes carry this name, for two roles. The Megatron Core class
+    (``megatron.core.datasets.gpt_dataset.GPTDatasetConfig``) is the runtime object the dataset
+    builder consumes: it needs a tokenizer instance to construct and derives ``split_matrix``,
+    ``mock`` and ``token_dtype_code`` eagerly. This class is the declaration: what the user asked
+    for, built at parse time, from YAML or in Python, without a tokenizer, serializable, and
+    identical before and after ``finalize()``. It inherits the Megatron Core field names so that
+    CLI, YAML, Python and Megatron-Bridge recipes declare the same thing, and it is never handed to
+    dataset code: ``to_core_config()`` is the only place the two meet; it builds a fresh runtime
+    object from the declaration and a ``DatasetRuntimeContext``. Modules that see both classes
+    import the Megatron Core one as ``MCoreGPTDatasetConfig``.
     """
 
     # Megatron Core fields redeclared so Python / YAML construction gets the CLI defaults, and so
