@@ -2663,6 +2663,9 @@ def setup_model_and_optimizer(
             optim_cfg,
             model,
             config_overrides=optim_cfg_overrides,
+            pg_collection=(
+                pg_collection if pg_collection is not None else _get_model_pg_collection(model[0])
+            ),
             use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
