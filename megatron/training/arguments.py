@@ -3523,6 +3523,11 @@ def _add_experimental_args(parser):
                        help = 'Config file to add additional arguments')
 
     # Args of precision-aware optimizer.
+    group.add_argument('--stage-precision-aware-optimizer-state-on-cpu', action='store_true',
+                       help='Stage expanded precision-aware Adam checkpoint tensors on CPU. '
+                            'Reduces checkpoint GPU memory at the cost of host memory and transfers; '
+                            'requires the distributed optimizer and torch_dist without FSDP or '
+                            'optimizer CPU offload.')
     group.add_argument('--use-precision-aware-optimizer', action='store_true',
                        help='Use the precision-aware optimizer in TransformerEngine, which allows '
                        'setting the main params and optimizer states to lower precision, such as '

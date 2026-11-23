@@ -35,6 +35,53 @@ checkpoints need independent validation before resuming training.
 
 The following figures show the sharding scheme and the main steps of the parameter update.
 
+## CPU staging for precision-aware checkpoints
+
+Compressed Adam state can fit during training but exceed GPU memory when expanded for
+checkpointing. For Transformer Engine's precision-aware distributed Adam, enable
+`OptimizerConfig.stage_precision_aware_optimizer_state_on_cpu` or the training flag
+`--stage-precision-aware-optimizer-state-on-cpu` to move each expanded checkpoint tensor
+to CPU immediately. Metadata-only state dictionaries skip expansion entirely. This
+applies during saving and construction/restoration of loading state, including
+already-initialized optimizers.
+
+The option defaults to false. It preserves checkpoint keys, values, and dtypes, so
+staged and unstaged writers/readers interoperate without a format-version change.
+Training state and the Adam update remain on GPU; no Transformer Engine methods are
+replaced. FP32-only state is left unchanged because it does not need expansion.
+
+Use `torch_dist` with the distributed precision-aware optimizer. Optimizer CPU offload,
+FSDP, and precision modes where Core rather than TE manages master weights are excluded.
+Existing restrictions of each checkpoint layout still apply. In particular, this option
+does not make the deprecated `fully_sharded_model_space` layout usable with the current
+ShardedTensor API, or add remainder support to `fully_reshardable`.
+
+This is a memory-capacity option: host memory must accommodate the unscaled local state
+(and temporary copies during restore), and synchronous device-to-host transfers can
+increase checkpoint latency. Fully reshardable checkpoints and fully parallel loading
+can still allocate GPU communication buffers; staging does not eliminate those buffers.
+For applications that previously wrapped TE state access for CPU staging, set the Core
+optimizer option and remove that wrapper after adopting a Core version with this option.
+
+To measure the trade-off on a local filesystem, run the following in separate fresh
+processes, adding `--stage-on-cpu` for the second run and using different output paths:
+
+```bash
+uv run python -m torch.distributed.run --standalone --nproc-per-node=2 \
+  tools/benchmark_optimizer_checkpoint.py \
+  --count 64 --size 16777216 --remainders \
+  --output /tmp/optimizer-baseline --checkpoint /tmp/optimizer-checkpoint-baseline
+```
+
+This example uses 1,073,741,824 synthetic BF16 parameters, FP32 gradients, BF16 moments,
+and INT16 master-weight remainders. It exercises real Core DDP, TE Adam and synchronous
+DP-reshardable checkpoint IO. Each rank writes JSON with per-phase times, peak CUDA
+allocated/reserved bytes, and process RSS sampled every 5 ms. CUDA cache cleanup and
+correctness checks are outside timed phases. The filesystem cache is not flushed.
+Exact hashes cover model weights, unscaled optimizer state, step counters, and three
+updates after restoring a fresh optimizer. This measures checkpoint behavior, not
+end-to-end transformer throughput. Checkpoint files are removed after a successful run.
+
 ## Data Flow
 
 ![Diagram of gradient and parameter data flow through reduce-scatter, optimizer step, and all-gather across data parallel ranks](../../images/distrib_optimizer/data_flow.png)

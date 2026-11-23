@@ -210,6 +210,16 @@ class OptimizerConfig:
     to be set to lower precision. Defaults to False.
     """
 
+    stage_precision_aware_optimizer_state_on_cpu: bool = False
+    """Stage expanded Transformer Engine Adam checkpoint state on CPU, one tensor at a time.
+
+    Reduces temporary GPU memory when compressed optimizer state expands for checkpointing.
+    Requires the distributed precision-aware optimizer and ``torch_dist`` checkpoints, without
+    optimizer CPU offload or FSDP. Does not change checkpoint keys, values, or dtypes, and is a
+    no-op when all optimizer state dtypes are FP32. Trades host memory and synchronous transfers
+    for GPU memory; it does not offload optimizer computation.
+    """
+
     store_param_remainders: bool = True
     """If true, store the 16-bit FP32 parameter remainders in the optimizer state, excluding the
         16 bits shared with the BF16 parameters. This lowers GPU memory usage. Defaults to True.
@@ -532,6 +542,22 @@ class OptimizerConfig:
                     "set muon_split_qkv=False."
                 )
 
+        if self.stage_precision_aware_optimizer_state_on_cpu:
+            if (
+                not self.use_distributed_optimizer
+                or not self.use_precision_aware_optimizer
+                or self.optimizer_cpu_offload
+                or self.use_layer_wise_distributed_optimizer
+            ):
+                raise ValueError(
+                    "CPU checkpoint staging requires the distributed precision-aware Adam "
+                    "optimizer without optimizer CPU offload or the layer-wise optimizer."
+                )
+            if not self.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                raise ValueError(
+                    "CPU checkpoint staging requires Transformer Engine to manage master weights."
+                )
+
         # Dtypes may still be CLI strings here; finalize_optimizer_config maps them to torch.dtype.
         fp32 = (torch.float32, 'fp32')
         if self.use_precision_aware_optimizer:
@@ -605,6 +631,10 @@ class OptimizerConfig:
         ckpt_format: str | None,
     ) -> None:
         """Check settings shared with DDP and checkpointing without modifying them."""
+        if self.stage_precision_aware_optimizer_state_on_cpu:
+            if ckpt_format != "torch_dist" or use_torch_fsdp2 or ddp_config.use_megatron_fsdp:
+                raise ValueError("CPU checkpoint staging requires torch_dist without FSDP.")
+
         if self.optimizer_cpu_offload:
             assert not ddp_config.fp8_param_gather or self.fp8_recipe == "delayed", (
                 "When `--fp8-param-gather` is enabled, the optimizer cpu offload "

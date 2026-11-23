@@ -871,6 +871,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         self.is_stub_optimizer = False
+        if config.stage_precision_aware_optimizer_state_on_cpu:
+            config.validate()
+            if (
+                self.ddp_config.use_megatron_fsdp
+                or not USING_TE_OPTIMIZER
+                # Base state packing must not bypass a subclass's custom checkpoint exporter.
+                or type(optimizer) is not Adam
+            ):
+                raise ValueError(
+                    "CPU checkpoint staging requires Transformer Engine FusedAdam without FSDP."
+                )
         if self.ddp_config.use_megatron_fsdp:
             if config.embedding_min_norm is not None:
                 raise ValueError("embedding_min_norm is not supported with Megatron FSDP")
@@ -1152,7 +1163,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         optimizer state (e.g., exp_avg, exp_avg_sq) are stored in a separate
         checkpoint file by calling 'save_parameter_state()'.
         """
-        inner_state_dict = self.optimizer.state_dict()
+        inner_state_dict = self._get_inner_state_dict(include_state=False)
         state_dict = {}
 
         # Extract 'step', for non-Apex/TE support.
@@ -1268,7 +1279,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for param_group in state_dict["optimizer"]["param_groups"]:
             needed_groups = make_needed_groups(param_group)
             param_groups_map[needed_groups] = param_group
-        inner_state_dict = self.optimizer.state_dict()
+        inner_state_dict = self._get_inner_state_dict()
         state_dict_param_groups = []
         for inner_param_group in inner_state_dict["param_groups"]:
             needed_groups = make_needed_groups(inner_param_group)
@@ -1402,6 +1413,42 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             else:
                 raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
 
+    @property
+    def _stage_optimizer_state_on_cpu(self) -> bool:
+        """Whether checkpoint extraction needs to stage compressed TE state on CPU."""
+        return getattr(self.config, "stage_precision_aware_optimizer_state_on_cpu", False) and any(
+            dtype != torch.float32 for dtype in self.optimizer.name_to_dtype_map.values()
+        )
+
+    def _get_unscaled_optimizer_state(self, param, name):
+        """Extract one checkpoint tensor without retaining its GPU expansion when staging."""
+        tensor = self.optimizer.get_unscaled_state(param, name)
+        return tensor.cpu() if self._stage_optimizer_state_on_cpu else tensor
+
+    def _get_inner_state_dict(self, *, include_state: bool = True):
+        """Pack TE state without materializing all unscaled tensors on GPU at once.
+
+        The base optimizer packs parameter IDs and invokes state-dict hooks, just as TE does
+        before unscaling. Replace each packed state mapping, leaving live training state intact.
+        Metadata-only callers avoid unscaling and copying parameter state altogether.
+        """
+        if not self._stage_optimizer_state_on_cpu:
+            return self.optimizer.state_dict()
+
+        state_dict = torch.optim.Optimizer.state_dict(self.optimizer)
+        if not include_state:
+            state_dict["state"] = {}
+            return state_dict
+
+        for packed_group, group in zip(state_dict["param_groups"], self.optimizer.param_groups):
+            for param_id, param in zip(packed_group["params"], group["params"]):
+                if param_id in state_dict["state"]:
+                    state_dict["state"][param_id] = {
+                        name: self._get_unscaled_optimizer_state(param, name)
+                        for name in state_dict["state"][param_id]
+                    }
+        return state_dict
+
     def _get_main_param_and_optimizer_states(self, model_param):
         """Return a dict containing the main param and optimizer states corresponding to the input
         model_param.
@@ -1420,7 +1467,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     tensors[k] = self.optimizer.state[sharded_model_param][k]
                     continue
 
-                tensors[k] = self.optimizer.get_unscaled_state(sharded_model_param, k)
+                tensors[k] = self._get_unscaled_optimizer_state(sharded_model_param, k)
             tensors["param"] = tensors.pop("master_param")
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
