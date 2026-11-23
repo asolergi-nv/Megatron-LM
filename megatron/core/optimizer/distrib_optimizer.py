@@ -1201,6 +1201,49 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return state_dict
 
+    def _load_inner_optimizer_state_dict(self, state_dict):
+        """Reuse FP32 Adam moments when no TE state conversion is necessary.
+
+        TE's loader first runs the torch loader, then allocates scaled-state storage.
+        For plain FP32 master parameters and moments the second allocation is redundant.
+        Keep all other formats, subclasses, and custom load hooks on the TE path.
+        """
+        optimizer = self.optimizer
+        moment_keys = {"exp_avg", "exp_avg_sq"}
+        dtype_map = getattr(optimizer, "name_to_dtype_map", {})
+        use_torch_loader = (
+            USING_TE_OPTIMIZER
+            and type(optimizer) is Adam
+            and getattr(optimizer.load_state_dict, "__func__", None) is Adam.load_state_dict
+            and not self.config.use_precision_aware_optimizer
+            and not self.config.optimizer_cpu_offload
+            and not self.ddp_config.use_megatron_fsdp
+            and getattr(optimizer, "master_weights", None) is False
+            and getattr(optimizer, "store_param_remainders", None) is False
+            and not optimizer._optimizer_load_state_dict_pre_hooks
+            and not optimizer._optimizer_load_state_dict_post_hooks
+            and all(dtype_map.get(key) == torch.float32 for key in moment_keys)
+            and any(group["params"] for group in optimizer.param_groups)
+            and all(
+                param.dtype == torch.float32
+                for group in optimizer.param_groups
+                for param in group["params"]
+            )
+            and bool(state_dict["state"])
+            and all(
+                set(state) == moment_keys
+                and all(
+                    type(value) is torch.Tensor and value.dtype == torch.float32
+                    for value in state.values()
+                )
+                for state in state_dict["state"].values()
+            )
+        )
+        if use_torch_loader:
+            torch.optim.Optimizer.load_state_dict(optimizer, state_dict)
+        else:
+            optimizer.load_state_dict(state_dict)
+
     def load_state_dict(self, state_dict):
         """Load the state dict.
 
@@ -1354,7 +1397,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         v["step"] = step.detach().clone()
 
         # Optimizer.
-        self.optimizer.load_state_dict(
+        self._load_inner_optimizer_state_dict(
             {"state": state_dict_state, "param_groups": state_dict_param_groups}
         )
 
