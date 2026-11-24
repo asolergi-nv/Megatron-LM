@@ -211,6 +211,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_group (ProcessGroup): Group for sharding and all-gathers.
     """
 
+    # Callers must leave the inner loader intact: this class owns eligibility
+    # checks and preserves custom loaders/hooks when zero-copy loading is unsafe.
+    supports_memory_efficient_fp32_state_loading = True
+
     # enumerates fully reshardable optimizer formats (as opposed to formats
     # which depend on the internal optimizer buffers structure)
     checkpoint_fully_reshardable_formats: set[str] = {

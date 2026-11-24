@@ -41,7 +41,9 @@ def test_fp32_restore_reuses_moments_and_preserves_next_step(adam_state):
     restored = FusedAdam([restored_param], lr=0.01)
     reference = FusedAdam([reference_param], lr=0.01)
     reference.load_state_dict(copy.deepcopy(state))
-    _wrapper(restored)._load_inner_optimizer_state_dict(state)
+    wrapper = _wrapper(restored)
+    assert wrapper.supports_memory_efficient_fp32_state_loading
+    wrapper._load_inner_optimizer_state_dict(state)
     for key in ("exp_avg", "exp_avg_sq"):
         assert restored.state[restored_param][key].data_ptr() == state["state"][0][key].data_ptr()
     for optimizer, weight in ((restored, restored_param), (reference, reference_param)):
